@@ -14,7 +14,7 @@ typedef struct BloomParameters {
     float threshold, inverseTransition, amount, color, protection;
 } BloomParameters;
 
-static inline ColorRgb bloom_extract(ColorRgb source, ColorParameters color, BloomParameters p)
+static inline OE_FN ColorRgb bloom_extract(ColorRgb source, ColorParameters color, BloomParameters p)
 {
     ColorRgb c = color_matrix(color_curve_rgb(source, color.sourceCurve, 0), color.to709);
     c.r = BLOOM_MAX(c.r, 0.0f); c.g = BLOOM_MAX(c.g, 0.0f); c.b = BLOOM_MAX(c.b, 0.0f);
@@ -30,7 +30,7 @@ static inline ColorRgb bloom_extract(ColorRgb source, ColorParameters color, Blo
     return o;
 }
 
-static inline ColorRgb bloom_composite(ColorRgb c, ColorRgb glow, BloomParameters p, int matte)
+static inline OE_FN ColorRgb bloom_composite(ColorRgb c, ColorRgb glow, BloomParameters p, int matte)
 {
     if (matte) {
         ColorRgb o = {glow.r * p.amount * 0.35f, glow.g * p.amount * 0.35f, glow.b * p.amount * 0.35f};

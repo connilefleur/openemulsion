@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
 
+#ifdef _WIN32
 #include <Windows.h>
+#define CL_CALL __stdcall
+typedef HMODULE ClLibHandle;
+#else
+#include <dlfcn.h>
+#define CL_CALL
+typedef void* ClLibHandle;
+#endif
 
 #include <map>
 #include <memory>
@@ -38,21 +46,21 @@ static const cl_mem_flags CL_MEM_READ_WRITE = 1;
 static const cl_mem_flags CL_MEM_READ_ONLY = 4;
 static const cl_mem_flags CL_MEM_COPY_HOST_PTR = 32;
 
-typedef cl_int(__stdcall* clGetCommandQueueInfoProc)(cl_command_queue, cl_uint, size_t, void*, size_t*);
-typedef cl_program(__stdcall* clCreateProgramWithSourceProc)(cl_context, cl_uint, const char**, const size_t*, cl_int*);
-typedef cl_int(__stdcall* clBuildProgramProc)(cl_program, cl_uint, const cl_device_id*, const char*, void*, void*);
-typedef cl_kernel(__stdcall* clCreateKernelProc)(cl_program, const char*, cl_int*);
-typedef cl_int(__stdcall* clSetKernelArgProc)(cl_kernel, cl_uint, size_t, const void*);
-typedef cl_int(__stdcall* clEnqueueNDRangeKernelProc)(cl_command_queue, cl_kernel, cl_uint, const size_t*, const size_t*, const size_t*, cl_uint, const cl_event*, cl_event*);
-typedef cl_mem(__stdcall* clCreateBufferProc)(cl_context, cl_mem_flags, size_t, void*, cl_int*);
-typedef cl_int(__stdcall* clReleaseMemObjectProc)(cl_mem);
-typedef cl_int(__stdcall* clReleaseEventProc)(cl_event);
-typedef cl_int(__stdcall* clReleaseKernelProc)(cl_kernel);
-typedef cl_int(__stdcall* clReleaseProgramProc)(cl_program);
-typedef cl_int(__stdcall* clGetProgramBuildInfoProc)(cl_program, cl_device_id, cl_uint, size_t, void*, size_t*);
+typedef cl_int(CL_CALL* clGetCommandQueueInfoProc)(cl_command_queue, cl_uint, size_t, void*, size_t*);
+typedef cl_program(CL_CALL* clCreateProgramWithSourceProc)(cl_context, cl_uint, const char**, const size_t*, cl_int*);
+typedef cl_int(CL_CALL* clBuildProgramProc)(cl_program, cl_uint, const cl_device_id*, const char*, void*, void*);
+typedef cl_kernel(CL_CALL* clCreateKernelProc)(cl_program, const char*, cl_int*);
+typedef cl_int(CL_CALL* clSetKernelArgProc)(cl_kernel, cl_uint, size_t, const void*);
+typedef cl_int(CL_CALL* clEnqueueNDRangeKernelProc)(cl_command_queue, cl_kernel, cl_uint, const size_t*, const size_t*, const size_t*, cl_uint, const cl_event*, cl_event*);
+typedef cl_mem(CL_CALL* clCreateBufferProc)(cl_context, cl_mem_flags, size_t, void*, cl_int*);
+typedef cl_int(CL_CALL* clReleaseMemObjectProc)(cl_mem);
+typedef cl_int(CL_CALL* clReleaseEventProc)(cl_event);
+typedef cl_int(CL_CALL* clReleaseKernelProc)(cl_kernel);
+typedef cl_int(CL_CALL* clReleaseProgramProc)(cl_program);
+typedef cl_int(CL_CALL* clGetProgramBuildInfoProc)(cl_program, cl_device_id, cl_uint, size_t, void*, size_t*);
 
 struct OpenCLApi {
-    HMODULE dll = nullptr;
+    ClLibHandle dll = nullptr;
     clGetCommandQueueInfoProc clGetCommandQueueInfo = nullptr;
     clCreateProgramWithSourceProc clCreateProgramWithSource = nullptr;
     clBuildProgramProc clBuildProgram = nullptr;
@@ -298,9 +306,15 @@ static OpenCLApi* api()
     static OpenCLApi a;
     static std::once_flag once;
     std::call_once(once, [&] {
+#ifdef _WIN32
         a.dll = LoadLibraryA("OpenCL.dll");
         if (!a.dll) return;
 #define LOAD_CL(name) a.name = reinterpret_cast<name##Proc>(GetProcAddress(a.dll, #name)); if (!a.name) return
+#else
+        a.dll = dlopen("libOpenCL.so.1", RTLD_LAZY);
+        if (!a.dll) return;
+#define LOAD_CL(name) a.name = reinterpret_cast<name##Proc>(dlsym(a.dll, #name)); if (!a.name) return
+#endif
         LOAD_CL(clGetCommandQueueInfo);
         LOAD_CL(clCreateProgramWithSource);
         LOAD_CL(clBuildProgram);

@@ -7,6 +7,7 @@
 #ifdef __cplusplus
 #include <cmath>
 #include <cstdint>
+#include "CudaCompat.h"
 typedef uint32_t GrainUInt;
 #define GRAIN_FLOOR std::floor
 #define GRAIN_SQRT std::sqrt
@@ -14,6 +15,9 @@ typedef uint32_t GrainUInt;
 #else
 // Match CPU coordinate rounding so a GPU FMA cannot move a grain lattice sample.
 #pragma OPENCL FP_CONTRACT OFF
+#ifndef OE_FN
+#define OE_FN
+#endif
 typedef uint GrainUInt;
 #define GRAIN_FLOOR floor
 #define GRAIN_SQRT sqrt
@@ -38,7 +42,7 @@ typedef struct GrainParameters {
     int prePrint;
 } GrainParameters;
 
-static inline GrainUInt grain_hash(GrainUInt value)
+static inline OE_FN GrainUInt grain_hash(GrainUInt value)
 {
     value ^= value >> 16;
     value *= 0x7feb352du;
@@ -48,26 +52,26 @@ static inline GrainUInt grain_hash(GrainUInt value)
     return value;
 }
 
-static inline float grain_random(GrainUInt value)
+static inline OE_FN float grain_random(GrainUInt value)
 {
     return (float)(grain_hash(value) & 0x00ffffffu) / 16777215.0f - 0.5f;
 }
 
-static inline GrainVector grain_corner(int x, int y, GrainUInt seed)
+static inline OE_FN GrainVector grain_corner(int x, int y, GrainUInt seed)
 {
     GrainUInt base = (GrainUInt)x * 0x9e3779b9u ^ (GrainUInt)y * 0x85ebca6bu ^ seed;
     GrainVector result = {grain_random(base), grain_random(base + 0x68bc21ebu), grain_random(base + 0x02e5be93u)};
     return result;
 }
 
-static inline float grain_interpolate(float a, float b, float c, float d, float tx, float ty, float normalization)
+static inline OE_FN float grain_interpolate(float a, float b, float c, float d, float tx, float ty, float normalization)
 {
     float top = a + (b - a) * tx;
     float bottom = c + (d - c) * tx;
     return (top + (bottom - top) * ty) * normalization;
 }
 
-static inline GrainVector grain_field(float x, float y, GrainUInt seed)
+static inline OE_FN GrainVector grain_field(float x, float y, GrainUInt seed)
 {
     int ix = (int)GRAIN_FLOOR(x), iy = (int)GRAIN_FLOOR(y);
     float tx = x - (float)ix, ty = y - (float)iy;
@@ -85,7 +89,7 @@ static inline GrainVector grain_field(float x, float y, GrainUInt seed)
     return result;
 }
 
-static inline float grain_smooth(float low, float high, float value)
+static inline OE_FN float grain_smooth(float low, float high, float value)
 {
     float t = (value - low) / (high - low);
     t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
@@ -93,7 +97,7 @@ static inline float grain_smooth(float low, float high, float value)
 }
 
 // Blend lattice weights into a quadratic B-spline: smoother edges, same pitch and variance.
-static inline GrainVector grain_soft_field(float x, float y, GrainUInt seed, float softness)
+static inline OE_FN GrainVector grain_soft_field(float x, float y, GrainUInt seed, float softness)
 {
     int ix = (int)GRAIN_FLOOR(x + 0.5f), iy = (int)GRAIN_FLOOR(y + 0.5f);
     float tx = x - (float)ix, ty = y - (float)iy;
@@ -121,12 +125,12 @@ static inline GrainVector grain_soft_field(float x, float y, GrainUInt seed, flo
     return result;
 }
 
-static inline float grain_shape(float value, float roughness)
+static inline OE_FN float grain_shape(float value, float roughness)
 {
     return value * (1.0f + roughness * (GRAIN_ABS(value) * 1.5f - 0.25f));
 }
 
-static inline GrainVector grain_delta(int x, int y, float luminance, GrainParameters p)
+static inline OE_FN GrainVector grain_delta(int x, int y, float luminance, GrainParameters p)
 {
     float px = ((float)x + 0.5f) * p.inverseSize * p.inverseStretch;
     float py = ((float)y + 0.5f) * p.inverseSize;

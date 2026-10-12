@@ -5,19 +5,23 @@
 
 #ifdef __cplusplus
 #include <cmath>
+#include "CudaCompat.h"
 #define HALATION_MAX std::fmax
 #define HALATION_MIN std::fmin
 #else
 #define HALATION_MAX fmax
 #define HALATION_MIN fmin
 #pragma OPENCL FP_CONTRACT OFF
+#ifndef OE_FN
+#define OE_FN
+#endif
 #endif
 
 typedef struct HalationParameters {
     float threshold, inverseTransition, red, green, blue;
 } HalationParameters;
 
-static inline float halation_key(float r, float g, float b, HalationParameters p)
+static inline OE_FN float halation_key(float r, float g, float b, HalationParameters p)
 {
     const float hot = HALATION_MAX(r, HALATION_MAX(g, b));
     const float luma = r * 0.2126f + g * 0.7152f + b * 0.0722f;
@@ -26,7 +30,7 @@ static inline float halation_key(float r, float g, float b, HalationParameters p
     return t * t * (3.0f - 2.0f * t);
 }
 
-static inline float halation_signal(float tight, float broad, float center, float amount, float aura)
+static inline OE_FN float halation_signal(float tight, float broad, float center, float amount, float aura)
 {
     return HALATION_MAX(tight - center * 0.20f, 0.0f) * amount * 1.45f +
            HALATION_MAX(broad - center * 0.08f, 0.0f) * aura * 0.85f;

@@ -125,6 +125,27 @@ The built bundle is at `dist/OpenEmulsion.ofx.bundle`. To install a development 
 
 This installs into the project's `ofx-plugins` folder and adds it to your user `OFX_PLUGIN_PATH`. Keep the project folder in place and restart Resolve from the Start Menu or a new shell. Alternatively, use the manual installation above.
 
+## Build on Linux
+
+Prerequisites: a C++17 compiler (GCC), CMake 3.20+, Ninja, OpenCL headers and ICD loader (for example `ocl-icd-devel`), and DaVinci Resolve's OpenFX developer files (default `/opt/resolve/Developer/OpenFX`). The NVIDIA CUDA toolkit is optional; when `nvcc` is found, the CUDA backend is built. Without it, the plugin builds with OpenCL and CPU rendering only.
+
+```bash
+tools/build_ofx.sh
+ctest --test-dir build --output-on-failure
+```
+
+For a different SDK location, use `tools/build_ofx.sh --resolve-openfx-root /path/to/OpenFX`. If `nvcc` is not on `PATH`, pass `-- -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc`. The equivalent direct command is `cmake -S ofx -B build -G Ninja -DCMAKE_BUILD_TYPE=Release`.
+
+The bundle is written to `dist/OpenEmulsion.ofx.bundle`. To install it, close Resolve and run:
+
+```bash
+tools/install_ofx.sh
+```
+
+This copies the bundle to `/usr/OFX/Plugins` using `sudo`. `tools/install_ofx.sh --user` copies it to the project's `ofx-plugins` folder instead and prints the `OFX_PLUGIN_PATH` to set.
+
+Linux differences: user preset file dialogs use `kdialog`, falling back to `zenity`, so one of them must be installed. CUDA, OpenCL, and CPU rendering produce the same results; see [Development](docs/DEVELOPMENT.md#rendering-and-performance).
+
 ## Documentation
 
 - [Film Color and Print](docs/FILM_RESPONSE.md), [Film Development](docs/FILM_DEVELOPMENT.md), and [Module Controls](docs/MODULE_CONTROLS.md)
@@ -136,9 +157,9 @@ This installs into the project's `ofx-plugins` folder and adds it to your user `
 
 ## Compatibility
 
-Windows x64 is currently supported; macOS, Linux, and native Windows ARM builds are not available. Development testing uses DaVinci Resolve 21.1.1 on Windows.
+Windows x64 is currently supported, and Linux x86-64 builds from source (see above); macOS and native Windows ARM builds are not available. Development testing uses DaVinci Resolve 21.1.1 on Windows.
 
-OpenCL acceleration requires Resolve to supply OpenCL image buffers. Otherwise, the plugin uses its CPU fallback. CUDA and Metal are not implemented.
+OpenCL acceleration requires Resolve to supply OpenCL image buffers. Otherwise, the plugin uses its CPU fallback. On Linux, and on Windows builds with the CUDA toolkit, Resolve can supply CUDA buffers when the plugin is built with the CUDA backend. Metal is not implemented.
 
 HDR PQ output is experimental. HLG, PQ input, and HDR export metadata are not implemented.
 

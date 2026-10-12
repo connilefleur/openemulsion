@@ -29,17 +29,17 @@ typedef struct FilmResponseParameters {
     int selectiveView;
 } FilmResponseParameters;
 
-static inline float response_clamp(float x, float lo, float hi)
+static inline OE_FN float response_clamp(float x, float lo, float hi)
 {
     return RESPONSE_MAX(lo, RESPONSE_MIN(x, hi));
 }
 
-static inline float response_luma(ColorRgb c)
+static inline OE_FN float response_luma(ColorRgb c)
 {
     return c.r * 0.2126f + c.g * 0.7152f + c.b * 0.0722f;
 }
 
-static inline ColorRgb response_saturation(ColorRgb c, float amount)
+static inline OE_FN ColorRgb response_saturation(ColorRgb c, float amount)
 {
     const float y = response_luma(c);
     ColorRgb o = {y + (c.r - y) * amount, y + (c.g - y) * amount, y + (c.b - y) * amount};
@@ -51,7 +51,7 @@ static inline ColorRgb response_saturation(ColorRgb c, float amount)
 #endif
 
 // Monotonic, C1 toe/shoulder joins and a fixed middle-gray pivot; no per-pixel logs.
-static inline float response_tone(float x, ResponseTone p)
+static inline OE_FN float response_tone(float x, ResponseTone p)
 {
     const float pivot = 0.46135613f;
     const float v = RESPONSE_MAX(x, 0.0f);
@@ -67,7 +67,7 @@ static inline float response_tone(float x, ResponseTone p)
     return y;
 }
 
-static inline ColorRgb response_palette(ColorRgb c, const float* matrix)
+static inline OE_FN ColorRgb response_palette(ColorRgb c, const float* matrix)
 {
     const float y = response_luma(c);
     ColorRgb o = color_matrix(c, matrix);
@@ -76,7 +76,7 @@ static inline ColorRgb response_palette(ColorRgb c, const float* matrix)
     return o;
 }
 
-static inline ColorRgb response_luminance_curve(ColorRgb c, ResponseTone p)
+static inline OE_FN ColorRgb response_luminance_curve(ColorRgb c, ResponseTone p)
 {
     const float y = response_luma(c);
     if (y <= 0.0f) { ColorRgb black = {0,0,0}; return black; }
@@ -86,7 +86,7 @@ static inline ColorRgb response_luminance_curve(ColorRgb c, ResponseTone p)
 }
 
 // Radial compression preserves weighted brightness/chroma direction in the working RGB domain.
-static inline ColorRgb response_gamut(ColorRgb c, float ceiling, float knee)
+static inline OE_FN ColorRgb response_gamut(ColorRgb c, float ceiling, float knee)
 {
     const float y = response_luma(c);
     const float hi = RESPONSE_MAX(c.r, RESPONSE_MAX(c.g, c.b)) - y;
@@ -100,13 +100,13 @@ static inline ColorRgb response_gamut(ColorRgb c, float ceiling, float knee)
     return o;
 }
 
-static inline float response_smooth(float lo, float hi, float x)
+static inline OE_FN float response_smooth(float lo, float hi, float x)
 {
     const float t = response_clamp((x - lo) / (hi - lo), 0.0f, 1.0f);
     return t * t * (3.0f - 2.0f * t);
 }
 
-static inline ColorRgb response_skin(ColorRgb c, float hue)
+static inline OE_FN ColorRgb response_skin(ColorRgb c, float hue)
 {
     if (hue == 0.0f) return c;
     const float y = response_luma(c);
@@ -123,7 +123,7 @@ static inline ColorRgb response_skin(ColorRgb c, float hue)
     return c;
 }
 
-static inline ColorRgb response_mix(ColorRgb a, ColorRgb b, float amount)
+static inline OE_FN ColorRgb response_mix(ColorRgb a, ColorRgb b, float amount)
 {
     if (amount <= 0.0f) return a;
     if (amount >= 1.0f) return b;
@@ -131,19 +131,19 @@ static inline ColorRgb response_mix(ColorRgb a, ColorRgb b, float amount)
     return c;
 }
 
-static inline ColorRgb response_apply_tone(ColorRgb c, ResponseTone tone, float strength)
+static inline OE_FN ColorRgb response_apply_tone(ColorRgb c, ResponseTone tone, float strength)
 {
     return strength > 0.0f ? response_mix(c, response_luminance_curve(c, tone), strength) : c;
 }
 
-static inline int response_clamps_negative(int modules, FilmResponseParameters p)
+static inline OE_FN int response_clamps_negative(int modules, FilmResponseParameters p)
 {
     return ((modules & 1) && (p.colorStrength > 0.0f || p.toneStrength > 0.0f)) ||
            ((modules & 2) && (p.printColorStrength > 0.0f || p.printToneStrength > 0.0f));
 }
 
 // Print and texture stages run after the negative; do not let them recolor Mono.
-static inline ColorRgb response_finish(ColorRgb c, int modules, FilmResponseParameters p)
+static inline OE_FN ColorRgb response_finish(ColorRgb c, int modules, FilmResponseParameters p)
 {
     if (!(modules & 1) || p.system != 4 || p.colorStrength <= 0.0f) return c;
     const float y = response_luma(c);
@@ -151,7 +151,7 @@ static inline ColorRgb response_finish(ColorRgb c, int modules, FilmResponsePara
     return response_mix(c, neutral, p.colorStrength);
 }
 
-static inline ColorRgb response_negative(ColorRgb c, FilmResponseParameters p)
+static inline OE_FN ColorRgb response_negative(ColorRgb c, FilmResponseParameters p)
 {
     const ColorRgb original = c;
     if (p.colorStrength > 0.0f) {
@@ -181,7 +181,7 @@ static inline ColorRgb response_negative(ColorRgb c, FilmResponseParameters p)
     return response_mix(beforeColor, c, p.colorStrength);
 }
 
-static inline ColorRgb response_negative_stage(ColorRgb c, FilmResponseParameters p)
+static inline OE_FN ColorRgb response_negative_stage(ColorRgb c, FilmResponseParameters p)
 {
     c = response_negative(c, p);
     // Match the negative-only node's floor before handing partial compression to later stages.
@@ -192,7 +192,7 @@ static inline ColorRgb response_negative_stage(ColorRgb c, FilmResponseParameter
 }
 
 // Creative development, not calibrated chemistry. Gray exposure stays anchored.
-static inline ColorRgb response_development(ColorRgb c, FilmResponseParameters p)
+static inline OE_FN ColorRgb response_development(ColorRgb c, FilmResponseParameters p)
 {
     if (p.push == 0.0f && p.richness == 0.0f && p.splitAmount == 0.0f) return c;
     float y = response_luma(c);
@@ -230,7 +230,7 @@ static inline ColorRgb response_development(ColorRgb c, FilmResponseParameters p
     return c;
 }
 
-static inline ColorRgb response_print(ColorRgb c, FilmResponseParameters p)
+static inline OE_FN ColorRgb response_print(ColorRgb c, FilmResponseParameters p)
 {
     c = color_balance(c, p.printGain);
     if (p.printColorStrength > 0.0f) c = response_mix(c, response_palette(c, p.printMatrix), p.printColorStrength);
@@ -256,7 +256,7 @@ static inline ColorRgb response_print(ColorRgb c, FilmResponseParameters p)
 }
 
 // Source-keyed hue selection avoids grain and creative print shifts changing the matte.
-static inline float response_selective_mask(ColorRgb source, FilmResponseParameters p)
+static inline OE_FN float response_selective_mask(ColorRgb source, FilmResponseParameters p)
 {
     source.r = RESPONSE_MAX(source.r, 0.0f);
     source.g = RESPONSE_MAX(source.g, 0.0f);
@@ -281,7 +281,7 @@ static inline float response_selective_mask(ColorRgb source, FilmResponseParamet
     return hueMask * saturationMask;
 }
 
-static inline ColorRgb response_selective(ColorRgb c, ColorRgb source, FilmResponseParameters p)
+static inline OE_FN ColorRgb response_selective(ColorRgb c, ColorRgb source, FilmResponseParameters p)
 {
     if (p.selectiveAmount <= 0.0f && p.selectiveView == 0) return c;
     const float mask = response_selective_mask(source, p);

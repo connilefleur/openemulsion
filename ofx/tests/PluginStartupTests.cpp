@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 #include <ofxImageEffect.h>
 #include <ofxMemory.h>
 #include <ofxMessage.h>
@@ -444,10 +448,17 @@ int main(int argc, char** argv)
         setString(p, kOfxImageEffectPropSupportedContexts, 1, kOfxImageEffectContextGeneral);
         setString(p, kOfxImageEffectPropSupportedPixelDepths, 0, kOfxBitDepthFloat);
         OfxHost host{p, fetchSuite};
+#ifdef _WIN32
         HMODULE module = LoadLibraryExA(argv[1], nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
         require(module != nullptr, "Cannot load plugin: " + std::to_string(GetLastError()));
         auto count = reinterpret_cast<int(*)()>(GetProcAddress(module, "OfxGetNumberOfPlugins"));
         auto getPlugin = reinterpret_cast<OfxPlugin*(*)(int)>(GetProcAddress(module, "OfxGetPlugin"));
+#else
+        void* module = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+        if (!module) require(false, std::string("Cannot load plugin: ") + dlerror());
+        auto count = reinterpret_cast<int(*)()>(dlsym(module, "OfxGetNumberOfPlugins"));
+        auto getPlugin = reinterpret_cast<OfxPlugin*(*)(int)>(dlsym(module, "OfxGetPlugin"));
+#endif
         require(count && getPlugin && count() == 1, "OFX exports");
         auto* plugin = getPlugin(0);
         require(plugin->pluginVersionMajor==pluginversion::Major && plugin->pluginVersionMinor==pluginversion::OfxMinor,"OFX exported version");
@@ -458,7 +469,11 @@ int main(int argc, char** argv)
         testContext(*plugin, kOfxImageEffectContextFilter);
         testContext(*plugin, kOfxImageEffectContextGeneral);
         require(plugin->mainEntry(kOfxActionUnload, nullptr, nullptr, nullptr) == kOfxStatOK, "Unload action");
+#ifdef _WIN32
         FreeLibrary(module);
+#else
+        dlclose(module);
+#endif
         std::cout << "Plugin startup regression passed" << std::endl;
         return 0;
     } catch (const std::exception& error) {

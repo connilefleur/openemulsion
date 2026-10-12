@@ -6,6 +6,7 @@
 // Shared C++/OpenCL transfer math. Coefficients and conventions: docs/COLOR_SPACES.md.
 #ifdef __cplusplus
 #include <cmath>
+#include "CudaCompat.h"
 #define COLOR_POW std::pow
 #define COLOR_LOG std::log
 #define COLOR_SQRT std::sqrt
@@ -18,6 +19,9 @@
 #define COLOR_MIN std::fmin
 #else
 #pragma OPENCL FP_CONTRACT OFF
+#ifndef OE_FN
+#define OE_FN
+#endif
 #define COLOR_POW pow
 #define COLOR_LOG log
 #define COLOR_SQRT sqrt
@@ -47,22 +51,22 @@ typedef struct ColorParameters {
     float hdrGain, hdrRolloff;
 } ColorParameters;
 
-static inline float color_signed_power(float x, float exponent)
+static inline OE_FN float color_signed_power(float x, float exponent)
 {
     return COLOR_SIGN(COLOR_POW(COLOR_ABS(x), exponent), x);
 }
 
-static inline float color_pow10(float x)
+static inline OE_FN float color_pow10(float x)
 {
     return COLOR_EXP2(x * 3.321928094887362f);
 }
 
-static inline float color_log10(float x)
+static inline OE_FN float color_log10(float x)
 {
     return COLOR_LOG2(x) * 0.3010299956639812f;
 }
 
-static inline float color_decode(float v, int curve)
+static inline OE_FN float color_decode(float v, int curve)
 {
     switch (curve) {
     case ColorGamma24: return color_signed_power(v, 2.4f);
@@ -113,7 +117,7 @@ static inline float color_decode(float v, int curve)
     }
 }
 
-static inline float color_encode(float x, int curve)
+static inline OE_FN float color_encode(float x, int curve)
 {
     switch (curve) {
     case ColorGamma24: return color_signed_power(x, 1.0f / 2.4f);
@@ -161,7 +165,7 @@ static inline float color_encode(float x, int curve)
     }
 }
 
-static inline ColorRgb color_matrix(ColorRgb v, const float* m)
+static inline OE_FN ColorRgb color_matrix(ColorRgb v, const float* m)
 {
     ColorRgb o = {m[0] * v.r + m[1] * v.g + m[2] * v.b,
                   m[3] * v.r + m[4] * v.g + m[5] * v.b,
@@ -169,7 +173,7 @@ static inline ColorRgb color_matrix(ColorRgb v, const float* m)
     return o;
 }
 
-static inline ColorRgb color_curve_rgb(ColorRgb v, int curve, int encode)
+static inline OE_FN ColorRgb color_curve_rgb(ColorRgb v, int curve, int encode)
 {
     ColorRgb o = {encode ? color_encode(v.r, curve) : color_decode(v.r, curve),
                   encode ? color_encode(v.g, curve) : color_decode(v.g, curve),
@@ -177,7 +181,7 @@ static inline ColorRgb color_curve_rgb(ColorRgb v, int curve, int encode)
     return o;
 }
 
-static inline ColorRgb color_balance(ColorRgb v, ColorRgb gain)
+static inline OE_FN ColorRgb color_balance(ColorRgb v, ColorRgb gain)
 {
     const int linear = (gain.r != 1.0f || gain.g != 1.0f || gain.b != 1.0f);
     if (linear) v = color_curve_rgb(v, ColorSRGB, 0);
@@ -186,7 +190,7 @@ static inline ColorRgb color_balance(ColorRgb v, ColorRgb gain)
 }
 
 // A perceptual Rec.709-primary sRGB domain keeps grain stable and has a finite slope at black.
-static inline ColorRgb color_to_work(ColorRgb v, ColorParameters p)
+static inline OE_FN ColorRgb color_to_work(ColorRgb v, ColorParameters p)
 {
     if (p.sourceIsWork) return v;
     return color_curve_rgb(color_matrix(color_curve_rgb(v, p.sourceCurve, 0), p.to709), ColorSRGB, 1);
@@ -194,7 +198,7 @@ static inline ColorRgb color_to_work(ColorRgb v, ColorParameters p)
 
 // Original SDR viewing curve: scene gray 0.18 -> display-linear 0.12,
 // continuous slopes at gray and the shoulder, with no artificial black offset.
-static inline float color_sdr_tone(float x)
+static inline OE_FN float color_sdr_tone(float x)
 {
     if (x <= 0.0f) return 0.0f;
     if (x <= 0.18f) return 0.12f * x / (0.234f - 0.30f * x);
@@ -204,7 +208,7 @@ static inline float color_sdr_tone(float x)
     return 1.0f - headroom * headroom / (headroom + slope * (x - 0.60f));
 }
 
-static inline float color_sdr_slope(float x)
+static inline OE_FN float color_sdr_slope(float x)
 {
     if (x <= 0.18f) {
         const float denominator = 0.234f - 0.30f*x;
@@ -217,7 +221,7 @@ static inline float color_sdr_slope(float x)
 
 // Centered controls preserve the established curve exactly at zero. Changing
 // contrast pivots at scene gray; rolloff moves only the C1 shoulder join.
-static inline float color_sdr_view_tone(float x, ColorParameters p)
+static inline OE_FN float color_sdr_view_tone(float x, ColorParameters p)
 {
     if (p.sdrContrast == 0.0f && p.sdrRolloff == 0.0f) return color_sdr_tone(x);
     if (x <= 0.0f) return 0.0f;
@@ -231,7 +235,7 @@ static inline float color_sdr_view_tone(float x, ColorParameters p)
     return 1.0f-headroom*headroom/(headroom+slope*(x-join));
 }
 
-static inline float color_sdr_view_slope(float x, ColorParameters p)
+static inline OE_FN float color_sdr_view_slope(float x, ColorParameters p)
 {
     if (p.sdrContrast == 0.0f && p.sdrRolloff == 0.0f) return color_sdr_slope(x);
     const float contrast = 1.0f+0.25f*p.sdrContrast;
@@ -250,7 +254,7 @@ static inline float color_sdr_view_slope(float x, ColorParameters p)
 // Join the existing tone at peak RGB = 1 with a matching slope. Along a
 // fixed chromatic ray, ratio is constant and both shoulders are monotonic.
 // Limiting headroom by that ratio avoids forcing a saturated emitter to white.
-static inline float color_sdr_emitter_tone(float y, float peak)
+static inline OE_FN float color_sdr_emitter_tone(float y, float peak)
 {
     if (peak <= 1.0f) return color_sdr_tone(y);
     const float ratio = COLOR_MIN(1.0f,y/peak);
@@ -262,7 +266,7 @@ static inline float color_sdr_emitter_tone(float y, float peak)
     return knee + headroom*(high/(headroom+high));
 }
 
-static inline float color_sdr_view_emitter_tone(float y, float peak, ColorParameters p)
+static inline OE_FN float color_sdr_view_emitter_tone(float y, float peak, ColorParameters p)
 {
     if (p.sdrContrast == 0.0f && p.sdrRolloff == 0.0f) return color_sdr_emitter_tone(y,peak);
     if (peak <= 1.0f) return color_sdr_view_tone(y,p);
@@ -274,7 +278,7 @@ static inline float color_sdr_view_emitter_tone(float y, float peak, ColorParame
     return knee+headroom*(high/(headroom+high));
 }
 
-static inline ColorRgb color_sdr_gamut(ColorRgb c, float mapped)
+static inline OE_FN ColorRgb color_sdr_gamut(ColorRgb c, float mapped)
 {
     const float hi = COLOR_MAX(c.r, COLOR_MAX(c.g,c.b)) - mapped;
     const float lo = mapped - COLOR_MIN(c.r, COLOR_MIN(c.g,c.b));
@@ -293,7 +297,7 @@ static inline ColorRgb color_sdr_gamut(ColorRgb c, float mapped)
     return c;
 }
 
-static inline ColorRgb color_sdr_view_gamut(ColorRgb c, float mapped, ColorParameters p)
+static inline OE_FN ColorRgb color_sdr_view_gamut(ColorRgb c, float mapped, ColorParameters p)
 {
     if (p.sdrGamut == 0.0f) return color_sdr_gamut(c,mapped);
     const float hi = COLOR_MAX(c.r,COLOR_MAX(c.g,c.b))-mapped;
@@ -317,7 +321,7 @@ static inline ColorRgb color_sdr_view_gamut(ColorRgb c, float mapped, ColorParam
 // shoulders flatten their texture. Fixed chroma makes this exposure-monotonic;
 // A root shoulder gives a C1 join at peak one without the excessive intermediate
 // contrast reduction of a logarithmic input shoulder.
-static inline float color_sdr_detail_peak(float peak, float gate)
+static inline OE_FN float color_sdr_detail_peak(float peak, float gate)
 {
     if (peak <= 1.0f || gate <= 0.0f) return peak;
     const float strength = 2.0f*gate;
@@ -326,7 +330,7 @@ static inline float color_sdr_detail_peak(float peak, float gate)
 }
 
 // Keep conversion math separate: textures and selection keys still see scene data.
-static inline ColorRgb color_render_work(ColorRgb work, ColorParameters p)
+static inline OE_FN ColorRgb color_render_work(ColorRgb work, ColorParameters p)
 {
     if (!p.renderSDR) return work;
     ColorRgb linear = color_curve_rgb(work, ColorSRGB, 0);
@@ -362,7 +366,7 @@ static inline ColorRgb color_render_work(ColorRgb work, ColorParameters p)
 }
 
 // Original HDR tone scale, in reference-white units. C1 joins at gray and white.
-static inline float color_hdr_tone(float x, float ceiling)
+static inline OE_FN float color_hdr_tone(float x, float ceiling)
 {
     if (x <= 0.0f) return 0.0f;
     if (x <= 0.18f) return 0.12f*x/(0.234f-0.30f*x);
@@ -376,7 +380,7 @@ static inline float color_hdr_tone(float x, float ceiling)
     return 1.0f+headroom*(high/(headroom+high));
 }
 
-static inline float color_hdr_viewing_tone(float x, ColorParameters p)
+static inline OE_FN float color_hdr_viewing_tone(float x, ColorParameters p)
 {
     const float ceiling = p.hdrPeak/p.hdrWhite;
     if (p.hdrRolloff == 0.0f || x <= 1.0f) return color_hdr_tone(x,ceiling);
@@ -388,7 +392,7 @@ static inline float color_hdr_viewing_tone(float x, ColorParameters p)
 }
 
 // HDR runs after creative/texture finishing, in linear destination primaries.
-static inline ColorRgb color_hdr_output(ColorRgb c, ColorParameters p)
+static inline OE_FN ColorRgb color_hdr_output(ColorRgb c, ColorParameters p)
 {
     if (p.hdrGain != 1.0f) {
         c.r *= p.hdrGain; c.g *= p.hdrGain; c.b *= p.hdrGain;
@@ -404,7 +408,7 @@ static inline ColorRgb color_hdr_output(ColorRgb c, ColorParameters p)
     return c;
 }
 
-static inline ColorRgb color_from_work(ColorRgb v, ColorParameters p)
+static inline OE_FN ColorRgb color_from_work(ColorRgb v, ColorParameters p)
 {
     if (p.outputIsWork) return v;
     ColorRgb linear = color_curve_rgb(v, ColorSRGB, 0);

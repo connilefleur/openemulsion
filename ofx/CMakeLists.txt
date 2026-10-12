@@ -7,10 +7,23 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(RESOLVE_OPENFX_ROOT "C:/ProgramData/Blackmagic Design/DaVinci Resolve/Support/Developer/OpenFX" CACHE PATH "DaVinci Resolve OpenFX developer directory")
-if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-    message(FATAL_ERROR "OpenEmulsion currently supports Windows x64 only.")
+if(WIN32)
+    set(RESOLVE_OPENFX_DEFAULT "C:/ProgramData/Blackmagic Design/DaVinci Resolve/Support/Developer/OpenFX")
+    set(OFX_BUNDLE_ARCH "Win64")
+elseif(APPLE)
+    set(RESOLVE_OPENFX_DEFAULT "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/OpenFX")
+    set(OFX_BUNDLE_ARCH "MacOS")
+else()
+    set(RESOLVE_OPENFX_DEFAULT "/opt/resolve/Developer/OpenFX")
+    set(OFX_BUNDLE_ARCH "Linux-x86-64")
 endif()
+set(RESOLVE_OPENFX_ROOT "${RESOLVE_OPENFX_DEFAULT}" CACHE PATH "DaVinci Resolve OpenFX developer directory")
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "OpenEmulsion supports 64-bit builds only.")
+endif()
+set(OFX_BUNDLE_BINARIES "${CMAKE_BINARY_DIR}/OpenEmulsion.ofx.bundle/Contents/${OFX_BUNDLE_ARCH}")
+
+find_package(Threads REQUIRED)
 
 set(OFX_SUPPORT "${RESOLVE_OPENFX_ROOT}/Support")
 set(OFX_API "${RESOLVE_OPENFX_ROOT}/OpenFX-1.4")
@@ -59,8 +72,62 @@ target_include_directories(OpenEmulsion PRIVATE
     "${OFX_SUPPORT}/include"
 )
 
-target_compile_definitions(OpenEmulsion PRIVATE NOMINMAX)
-target_link_libraries(OpenEmulsion PRIVATE comdlg32)
+if(WIN32)
+    target_compile_definitions(OpenEmulsion PRIVATE NOMINMAX)
+    target_link_libraries(OpenEmulsion PRIVATE comdlg32)
+else()
+    # The Support library only marks its entry points visible when the legacy
+    # `linux` macro is set, which strict -std=c++17 does not define.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set_source_files_properties("${OFX_SUPPORT}/Library/ofxsImageEffect.cpp"
+            TARGET_DIRECTORY OpenEmulsion PROPERTIES COMPILE_DEFINITIONS "linux=1")
+    endif()
+    set_target_properties(OpenEmulsion PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        POSITION_INDEPENDENT_CODE ON)
+    if(NOT APPLE)
+        # Export only the OFX entry points.
+        target_link_options(OpenEmulsion PRIVATE
+            "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/OpenEmulsion.map"
+            "LINKER:--no-undefined")
+        set_property(TARGET OpenEmulsion APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/OpenEmulsion.map")
+    endif()
+endif()
+target_link_libraries(OpenEmulsion PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+
+# CUDA backend for hosts that pass CUDA buffers (Resolve's default on Linux/Windows
+# NVIDIA systems). Optional: without a CUDA compiler the plugin keeps OpenCL + CPU.
+option(OPENEMULSION_CUDA "Build the CUDA render backend when a CUDA compiler is available" ON)
+# nvcc has no MinGW host compiler, so MinGW builds keep OpenCL + CPU.
+if(OPENEMULSION_CUDA AND NOT APPLE AND NOT MINGW)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+        if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+            # SASS for Turing/Ampere/Ada plus compute_89 PTX so newer GPUs can JIT instead of failing to launch.
+            set(CMAKE_CUDA_ARCHITECTURES "75-real;86-real;89")
+        endif()
+        enable_language(CUDA)
+        find_package(CUDAToolkit REQUIRED)
+        target_sources(OpenEmulsion PRIVATE src/CudaKernel.cu)
+        target_compile_definitions(OpenEmulsion PRIVATE OPENEMULSION_HAVE_CUDA)
+        # Match the math headers' OpenCL FP_CONTRACT OFF so CUDA stays close to CPU/OpenCL output.
+        target_compile_options(OpenEmulsion PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>)
+        set_target_properties(OpenEmulsion PROPERTIES
+            CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+            CUDA_STANDARD 17
+            CUDA_STANDARD_REQUIRED ON
+            CUDA_SEPARABLE_COMPILATION OFF
+            CUDA_RUNTIME_LIBRARY Static
+            CUDA_VISIBILITY_PRESET hidden)
+        target_link_libraries(OpenEmulsion PRIVATE CUDA::cudart_static)
+        set(OPENEMULSION_CUDA_ENABLED ON)
+        message(STATUS "OpenEmulsion CUDA backend enabled (architectures: ${CMAKE_CUDA_ARCHITECTURES})")
+    else()
+        message(STATUS "No CUDA compiler found; building without the CUDA backend.")
+    endif()
+endif()
 
 if(MINGW)
     target_compile_options(OpenEmulsion PRIVATE -Wall -Wextra -Wno-unused-parameter)
@@ -70,8 +137,8 @@ endif()
 set_target_properties(OpenEmulsion PROPERTIES
     PREFIX ""
     SUFFIX ".ofx"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/OpenEmulsion.ofx.bundle/Contents/Win64"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/OpenEmulsion.ofx.bundle/Contents/Win64"
+    RUNTIME_OUTPUT_DIRECTORY "${OFX_BUNDLE_BINARIES}"
+    LIBRARY_OUTPUT_DIRECTORY "${OFX_BUNDLE_BINARIES}"
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
 )
 
@@ -79,8 +146,8 @@ set_target_properties(OpenEmulsion PROPERTIES
 foreach(config IN LISTS CMAKE_CONFIGURATION_TYPES)
     string(TOUPPER "${config}" config_upper)
     set_target_properties(OpenEmulsion PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY_${config_upper} "${CMAKE_BINARY_DIR}/OpenEmulsion.ofx.bundle/Contents/Win64"
-        LIBRARY_OUTPUT_DIRECTORY_${config_upper} "${CMAKE_BINARY_DIR}/OpenEmulsion.ofx.bundle/Contents/Win64")
+        RUNTIME_OUTPUT_DIRECTORY_${config_upper} "${OFX_BUNDLE_BINARIES}"
+        LIBRARY_OUTPUT_DIRECTORY_${config_upper} "${OFX_BUNDLE_BINARIES}")
 endforeach()
 
 # Run even without a relink so resource-only edits reach both bundles.
@@ -129,7 +196,10 @@ if(BUILD_COLOR_BENCH)
     add_library(ColorBench SHARED tools/ColorBench.cpp)
     add_executable(FullFrameBench tools/FullFrameBench.cpp src/OpenCLKernel.cpp)
     target_include_directories(FullFrameBench PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}")
-    target_compile_definitions(FullFrameBench PRIVATE NOMINMAX)
+    if(WIN32)
+        target_compile_definitions(FullFrameBench PRIVATE NOMINMAX)
+    endif()
+    target_link_libraries(FullFrameBench PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
     if(MINGW)
         target_link_options(FullFrameBench PRIVATE -static-libgcc -static-libstdc++ -static)
     endif()
@@ -163,12 +233,19 @@ if(BUILD_COLOR_BENCH)
     endif()
 endif()
 if(BUILD_TESTING)
-    find_program(POWERSHELL_EXECUTABLE NAMES pwsh powershell REQUIRED)
-    add_test(NAME VersionTrackingRegression COMMAND "${POWERSHELL_EXECUTABLE}" -NoProfile -ExecutionPolicy Bypass
-        -File "${CMAKE_SOURCE_DIR}/../tools/test_plugin_version.ps1")
+    find_program(POWERSHELL_EXECUTABLE NAMES pwsh powershell)
+    if(POWERSHELL_EXECUTABLE)
+        add_test(NAME VersionTrackingRegression COMMAND "${POWERSHELL_EXECUTABLE}" -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_SOURCE_DIR}/../tools/test_plugin_version.ps1")
+    else()
+        message(STATUS "PowerShell not found; skipping VersionTrackingRegression")
+    endif()
     add_executable(PluginStartupTests tests/PluginStartupTests.cpp)
     target_include_directories(PluginStartupTests PRIVATE src "${OFX_API}/include")
-    target_compile_definitions(PluginStartupTests PRIVATE NOMINMAX)
+    if(WIN32)
+        target_compile_definitions(PluginStartupTests PRIVATE NOMINMAX)
+    endif()
+    target_link_libraries(PluginStartupTests PRIVATE ${CMAKE_DL_LIBS})
     if(MINGW)
         target_link_options(PluginStartupTests PRIVATE -static-libgcc -static-libstdc++ -static)
     endif()
@@ -182,7 +259,23 @@ if(BUILD_TESTING)
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/PluginIconTests.cmake")
     add_executable(HalationTests tests/HalationTests.cpp src/OpenCLKernel.cpp)
     target_include_directories(HalationTests PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}")
-    target_compile_definitions(HalationTests PRIVATE NOMINMAX)
+    if(WIN32)
+        target_compile_definitions(HalationTests PRIVATE NOMINMAX)
+    endif()
+    target_link_libraries(HalationTests PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+    if(OPENEMULSION_CUDA_ENABLED)
+        # Run the same CPU parity sweeps against the CUDA backend; skipped at runtime without a CUDA device.
+        target_sources(HalationTests PRIVATE src/CudaKernel.cu)
+        target_compile_definitions(HalationTests PRIVATE OPENEMULSION_HAVE_CUDA)
+        target_compile_options(HalationTests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>)
+        set_target_properties(HalationTests PROPERTIES
+            CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+            CUDA_STANDARD 17
+            CUDA_STANDARD_REQUIRED ON
+            CUDA_SEPARABLE_COMPILATION OFF
+            CUDA_RUNTIME_LIBRARY Static)
+        target_link_libraries(HalationTests PRIVATE CUDA::cudart_static)
+    endif()
     if(MINGW)
         target_link_options(HalationTests PRIVATE -static-libgcc -static-libstdc++ -static)
     endif()
@@ -207,8 +300,10 @@ if(BUILD_TESTING)
     add_test(NAME SliderTuningRegression COMMAND SliderTuningTests)
     add_executable(UserPresetTests tests/UserPresetTests.cpp)
     target_include_directories(UserPresetTests PRIVATE src)
-    target_compile_definitions(UserPresetTests PRIVATE NOMINMAX)
-    target_link_libraries(UserPresetTests PRIVATE comdlg32)
+    if(WIN32)
+        target_compile_definitions(UserPresetTests PRIVATE NOMINMAX)
+        target_link_libraries(UserPresetTests PRIVATE comdlg32)
+    endif()
     if(MINGW)
         target_link_options(UserPresetTests PRIVATE -static-libgcc -static-libstdc++ -static)
     endif()

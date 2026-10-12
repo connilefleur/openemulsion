@@ -4,7 +4,11 @@ See the [README](../README.md#build-from-source) for build prerequisites and the
 
 ## Rendering and Performance
 
-C++ and OpenCL share the grain, color, and film-response math headers. Keep them compatible with both languages. OpenCL runs when Resolve supplies GPU image buffers; otherwise the plugin uses its multithreaded CPU renderer.
+C++, OpenCL, and CUDA share the grain, color, and film-response math headers. Keep them compatible with all three (CUDA uses `CudaCompat.h` and the `OE_FN` qualifier). The CUDA kernels in `CudaKernel.cu` mirror the OpenCL kernel source pass for pass and must match its output.
+
+The backend follows what Resolve supplies: CUDA when Resolve passes CUDA buffers and a stream, OpenCL when it passes OpenCL image buffers, and otherwise the multithreaded CPU renderer. The CUDA backend is built when `nvcc` is available (`OPENEMULSION_CUDA`, default ON; not for MinGW) and targets sm_75, sm_86, and sm_89 plus embedded sm_89 PTX for newer GPUs. It runs on the host's stream, does not synchronize, and links cudart statically. OpenCL is loaded at run time, so the bundle has no GPU library dependencies.
+
+On Linux, `OpenEmulsion.map` exports only the two OFX entry points. The CUDA parity tests in `HalationTests` skip without an NVIDIA GPU. The "Managed film" checks compare encoded values with a tolerance that also accepts matching decoded linear values, because the NVIDIA Linux driver differs slightly from the CPU there.
 
 GPU working buffers are reused. Disabled texture stages skip their work, and Grain Only skips diffusion entirely. Halation, Aura, and Bloom at zero avoid their unused processing. See [Bloom](BLOOM.md) and [Texture Controls](TEXTURE_CONTROLS.md) for work-grid and filtering details.
 

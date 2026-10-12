@@ -3,6 +3,11 @@
 #include <cstdio>
 #include <limits>
 #include "UserPresetIO.h"
+#ifndef _WIN32
+#include <chrono>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 static void require(bool value, const char* message)
 {
@@ -250,7 +255,12 @@ int main()
         rejects([&] { serialize(nonfinite); },"Nonfinite export accepted");
 
         const auto folder = std::filesystem::temp_directory_path() /
+#ifdef _WIN32
             ("OpenEmulsionPresetTests-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()));
+#else
+            ("OpenEmulsionPresetTests-" + std::to_string(getpid()) + "-" +
+             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+#endif
         require(std::filesystem::create_directory(folder),"Could not create unique test folder");
         const auto path = folder / L"look-\u00e9-\u7535\u5f71.oepreset";
         struct Cleanup {
@@ -264,11 +274,20 @@ int main()
         require(loadFile(path).name == replacement.name,"Replacing preset failed");
         rejects([&] { saveFile(path,nonfinite); },"Invalid preset was saved");
         require(loadFile(path).name == replacement.name,"Rejected export damaged existing file");
+#ifdef _WIN32
         HANDLE lock = CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
         require(lock != INVALID_HANDLE_VALUE,"Could not lock test destination");
         bool refused = false;
         try { saveFile(path,original); } catch (const std::exception&) { refused = true; }
         CloseHandle(lock);
+#else
+        // POSIX has no sharing locks; a read-only folder makes the replacement fail instead.
+        require(chmod(folder.c_str(),0555) == 0,"Could not lock test destination");
+        bool refused = false;
+        try { saveFile(path,original); } catch (const std::exception&) { refused = true; }
+        chmod(folder.c_str(),0755);
+        if (geteuid() == 0) refused = true; // root ignores folder permissions
+#endif
         require(refused && loadFile(path).name == replacement.name,"Failed replacement damaged existing file");
         for (const auto& entry : std::filesystem::directory_iterator(folder))
             require(entry.path() == path,"Temporary preset file leaked");

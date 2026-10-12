@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
+#ifdef _WIN32
 #include <Windows.h>
+#define OE_CL_API __stdcall
+#else
+#include <dlfcn.h>
+#define OE_CL_API
+#endif
 
 #include <array>
 #include <chrono>
@@ -21,6 +27,10 @@
 #include "LookPresetConfig.h"
 
 extern bool RunOpenEmulsionOpenCL(void*, int, int, double, const float*, const float*, float*);
+#ifdef OPENEMULSION_HAVE_CUDA
+#include <cuda_runtime_api.h>
+#include "CudaKernel.h"
+#endif
 
 static void require(bool value, const char* message)
 {
@@ -106,6 +116,17 @@ static void requireNear(float actual, float expected, float tolerance, const cha
         std::fprintf(stderr, "%s: actual %.9g, expected %.9g, tolerance %.9g\n", message, actual, expected, tolerance);
         require(false, message);
     }
+}
+
+// Encoded comparison that also accepts values whose display-linear decode agrees to 1e-7.
+// Gamma/PQ encodes have unbounded slope at black, so a one-ulp GPU/CPU libm difference in
+// a log decode (e.g. Log3G10 near zero) can show up as ~1e-4 in the encoded value.
+static void requireNearEncoded(float actual, float expected, int curve, float tolerance, const char* message)
+{
+    if (std::isfinite(actual) && std::abs(actual - expected) > tolerance &&
+        std::abs(color_decode(actual, curve) - color_decode(expected, curve)) <= 1e-7f)
+        return;
+    requireNear(actual, expected, tolerance, message);
 }
 
 static void testColorSpaces()
@@ -1106,25 +1127,52 @@ public:
     using UInt = unsigned int;
     using Bits = unsigned long long;
     using Handle = void*;
+    enum Backend { OpenCL, Cuda };
+    Backend backend = OpenCL;
     Handle context = nullptr, queue = nullptr, unordered = nullptr;
 
-    int (__stdcall *getPlatforms)(UInt, Handle*, UInt*) = nullptr;
-    int (__stdcall *getDevices)(Handle, Bits, UInt, Handle*, UInt*) = nullptr;
-    int (__stdcall *getDeviceInfo)(Handle, UInt, size_t, void*, size_t*) = nullptr;
-    Handle (__stdcall *createContext)(const intptr_t*, UInt, const Handle*, void*, void*, int*) = nullptr;
-    Handle (__stdcall *createQueue)(Handle, Handle, Bits, int*) = nullptr;
-    Handle (__stdcall *createBuffer)(Handle, Bits, size_t, void*, int*) = nullptr;
-    int (__stdcall *readBuffer)(Handle, Handle, UInt, size_t, size_t, void*, UInt, const Handle*, Handle*) = nullptr;
-    int (__stdcall *finish)(Handle) = nullptr;
-    int (__stdcall *releaseMem)(Handle) = nullptr;
-    int (__stdcall *releaseQueue)(Handle) = nullptr;
-    int (__stdcall *releaseContext)(Handle) = nullptr;
+    int (OE_CL_API *getPlatforms)(UInt, Handle*, UInt*) = nullptr;
+    int (OE_CL_API *getDevices)(Handle, Bits, UInt, Handle*, UInt*) = nullptr;
+    int (OE_CL_API *getDeviceInfo)(Handle, UInt, size_t, void*, size_t*) = nullptr;
+    Handle (OE_CL_API *createContext)(const intptr_t*, UInt, const Handle*, void*, void*, int*) = nullptr;
+    Handle (OE_CL_API *createQueue)(Handle, Handle, Bits, int*) = nullptr;
+    Handle (OE_CL_API *createBuffer)(Handle, Bits, size_t, void*, int*) = nullptr;
+    int (OE_CL_API *readBuffer)(Handle, Handle, UInt, size_t, size_t, void*, UInt, const Handle*, Handle*) = nullptr;
+    int (OE_CL_API *finish)(Handle) = nullptr;
+    int (OE_CL_API *releaseMem)(Handle) = nullptr;
+    int (OE_CL_API *releaseQueue)(Handle) = nullptr;
+    int (OE_CL_API *releaseContext)(Handle) = nullptr;
 
-    Gpu()
+    explicit Gpu(Backend selected = OpenCL) : backend(selected)
     {
+        if (backend == Cuda) {
+#ifdef OPENEMULSION_HAVE_CUDA
+            int devices = 0;
+            if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) { cudaGetLastError(); return; }
+            cudaStream_t primary = nullptr, secondary = nullptr;
+            require(cudaStreamCreate(&primary) == cudaSuccess, "Cannot create CUDA stream");
+            // CUDA streams are always in-order; a second non-blocking stream stands in for the OpenCL
+            // out-of-order queue so the per-stream scratch cache and cross-stream reuse are exercised.
+            if (cudaStreamCreateWithFlags(&secondary, cudaStreamNonBlocking) != cudaSuccess) secondary = nullptr;
+            queue = primary; unordered = secondary;
+            cudaDeviceProp properties {};
+            int device = 0;
+            cudaGetDevice(&device);
+            cudaGetDeviceProperties(&properties, device);
+            std::printf("CUDA device: %s\n", properties.name);
+#endif
+            return;
+        }
+#ifdef _WIN32
         HMODULE dll = LoadLibraryA("OpenCL.dll");
         if (!dll) return;
 #define LOAD(member, symbol) member = reinterpret_cast<decltype(member)>(GetProcAddress(dll, symbol)); require(member != nullptr, symbol)
+#else
+        void* dll = dlopen("libOpenCL.so.1", RTLD_LAZY | RTLD_LOCAL);
+        if (!dll) dll = dlopen("libOpenCL.so", RTLD_LAZY | RTLD_LOCAL);
+        if (!dll) return;
+#define LOAD(member, symbol) member = reinterpret_cast<decltype(member)>(dlsym(dll, symbol)); require(member != nullptr, symbol)
+#endif
         LOAD(getPlatforms, "clGetPlatformIDs");
         LOAD(getDevices, "clGetDeviceIDs");
         LOAD(getDeviceInfo, "clGetDeviceInfo");
@@ -1160,9 +1208,86 @@ public:
 
     ~Gpu()
     {
+        if (backend == Cuda) {
+#ifdef OPENEMULSION_HAVE_CUDA
+            // Streams are synchronised but intentionally not destroyed: RunOpenEmulsionCuda caches scratch
+            // buffers keyed by stream for the process lifetime, so a recycled handle must not alias them.
+            if (unordered) cudaStreamSynchronize(static_cast<cudaStream_t>(unordered));
+            if (queue) cudaStreamSynchronize(static_cast<cudaStream_t>(queue));
+#endif
+            return;
+        }
         if (unordered) { finish(unordered); releaseQueue(unordered); }
         if (queue) { finish(queue); releaseQueue(queue); }
         if (context) releaseContext(context);
+    }
+
+    Gpu(const Gpu&) = delete;
+    Gpu& operator=(const Gpu&) = delete;
+
+    const char* label() const { return backend == Cuda ? "CUDA" : "OpenCL"; }
+    void say(const char* text) const { std::printf("%s%s\n", label(), text); }
+
+    // Backend-neutral device buffer helpers so every parity sweep runs unchanged on OpenCL and CUDA.
+    Handle allocate(size_t bytes, const void* data, const char* message)
+    {
+#ifdef OPENEMULSION_HAVE_CUDA
+        if (backend == Cuda) {
+            void* buffer = nullptr;
+            require(cudaMalloc(&buffer, bytes) == cudaSuccess, message);
+            // A pageable cudaMemcpy may return before its DMA lands and does not order against the
+            // non-blocking stream, so finish the upload before any render reads the buffer.
+            if (data) require(cudaMemcpy(buffer, data, bytes, cudaMemcpyHostToDevice) == cudaSuccess &&
+                              cudaDeviceSynchronize() == cudaSuccess, message);
+            return buffer;
+        }
+#endif
+        int error = 0;
+        Handle buffer = data ? createBuffer(context, 4 | 32, bytes, const_cast<void*>(data), &error)
+                             : createBuffer(context, 1, bytes, nullptr, &error);
+        require(error == 0, message);
+        return buffer;
+    }
+
+    void release(Handle buffer)
+    {
+#ifdef OPENEMULSION_HAVE_CUDA
+        if (backend == Cuda) {
+            // Pending renders on our streams may still read/write the buffer.
+            if (queue) cudaStreamSynchronize(static_cast<cudaStream_t>(queue));
+            if (unordered) cudaStreamSynchronize(static_cast<cudaStream_t>(unordered));
+            cudaFree(buffer);
+            return;
+        }
+#endif
+        releaseMem(buffer);
+    }
+
+    bool run(Handle q, int width, int height, double time, const float* s, Handle src, Handle dst)
+    {
+#ifdef OPENEMULSION_HAVE_CUDA
+        if (backend == Cuda)
+            return RunOpenEmulsionCuda(q, width, height, time, s, static_cast<const float*>(src), static_cast<float*>(dst));
+#endif
+        return RunOpenEmulsionOpenCL(q, width, height, time, s, reinterpret_cast<const float*>(src), reinterpret_cast<float*>(dst));
+    }
+
+    bool finishQueue(Handle q)
+    {
+#ifdef OPENEMULSION_HAVE_CUDA
+        if (backend == Cuda) return cudaStreamSynchronize(static_cast<cudaStream_t>(q)) == cudaSuccess;
+#endif
+        return finish(q) == 0;
+    }
+
+    bool read(Handle q, Handle buffer, size_t bytes, void* output)
+    {
+#ifdef OPENEMULSION_HAVE_CUDA
+        if (backend == Cuda)
+            return cudaMemcpyAsync(output, buffer, bytes, cudaMemcpyDeviceToHost, static_cast<cudaStream_t>(q)) == cudaSuccess &&
+                   cudaStreamSynchronize(static_cast<cudaStream_t>(q)) == cudaSuccess;
+#endif
+        return readBuffer(q, buffer, 1, 0, bytes, output, 0, nullptr, nullptr) == 0;
     }
 
     void test(int width, int height, const grain::PackedSettings& s, bool outOfOrder, double time = 0.0)
@@ -1179,21 +1304,17 @@ public:
                 input[i] = encoded.r; input[i + 1] = encoded.g; input[i + 2] = encoded.b;
             }
         }
-        int error = 0;
-        Handle src = createBuffer(context, 4 | 32, count * sizeof(float), input.data(), &error);
-        require(error == 0, "Cannot create test input");
-        Handle dst = createBuffer(context, 1, count * sizeof(float), nullptr, &error);
-        require(error == 0, "Cannot create test output");
+        Handle src = allocate(count * sizeof(float), input.data(), "Cannot create test input");
+        Handle dst = allocate(count * sizeof(float), nullptr, "Cannot create test output");
         Handle q = outOfOrder ? unordered : queue;
         // Queue several renders before reading to exercise scratch reuse and mode switching.
         for (int render = 0; render < 3; ++render) {
             auto current = render == 2 ? s : settings(2.0f, 1.0f, 1.0f, render == 0 ? 2 : 4);
             if (render == 0 && s[film::BloomAmount] > 0) current[film::BloomAmount] = 1;
-            require(RunOpenEmulsionOpenCL(q, width, height, time, current.data(),
-                                          reinterpret_cast<const float*>(src), reinterpret_cast<float*>(dst)), "GPU render failed");
+            require(run(q, width, height, time, current.data(), src, dst), "GPU render failed");
         }
-        require(finish(q) == 0, "GPU execution failed");
-        require(readBuffer(q, dst, 1, 0, count * sizeof(float), output.data(), 0, nullptr, nullptr) == 0, "Cannot read GPU output");
+        require(finishQueue(q), "GPU execution failed");
+        require(read(q, dst, count * sizeof(float), output.data()), "Cannot read GPU output");
         const int modules = film::modulesForSettings(s.data());
         auto effective = s;
         if (!(modules & film::Halation)) effective[13] = 0.0f;
@@ -1279,8 +1400,8 @@ public:
                 }
             }
         }
-        releaseMem(src);
-        releaseMem(dst);
+        release(src);
+        release(dst);
     }
 
     void writeTexturePreview(const char* path, bool monochrome = false)
@@ -1447,11 +1568,8 @@ public:
         const int width = 3840, height = 2160;
         const size_t bytes = static_cast<size_t>(width) * height * 4 * sizeof(float);
         std::vector<float> input(bytes / sizeof(float), 0.7f);
-        int error = 0;
-        Handle src = createBuffer(context, 4 | 32, bytes, input.data(), &error);
-        require(error == 0, "Cannot allocate benchmark input");
-        Handle dst = createBuffer(context, 1, bytes, nullptr, &error);
-        require(error == 0, "Cannot allocate benchmark output");
+        Handle src = allocate(bytes, input.data(), "Cannot allocate benchmark input");
+        Handle dst = allocate(bytes, nullptr, "Cannot allocate benchmark output");
         std::vector<grain::PackedSettings> cases;
         for (int mode : {0,1}) for (int rendering : {color::ConversionOnly,color::Automatic}) for (float retention : {0.0f,1.0f}) {
             auto s=filmSettings(); s[0]=static_cast<float>(mode); s[26]=color::AlexaLogC3; s[27]=1;
@@ -1522,12 +1640,12 @@ public:
             s[16] = 0.16f;
             s[17] = 0.45f;
             s[18] = 0.32f;
-            require(RunOpenEmulsionOpenCL(queue, width, height, 0.0f, s.data(), reinterpret_cast<const float*>(src), reinterpret_cast<float*>(dst)), "Warmup failed");
-            require(finish(queue) == 0, "Warmup execution failed");
+            require(run(queue, width, height, 0.0f, s.data(), src, dst), "Warmup failed");
+            require(finishQueue(queue), "Warmup execution failed");
             const auto start = std::chrono::steady_clock::now();
             for (int frame = 0; frame < 12; ++frame)
-                require(RunOpenEmulsionOpenCL(queue, width, height, static_cast<float>(frame), s.data(), reinterpret_cast<const float*>(src), reinterpret_cast<float*>(dst)), "Benchmark render failed");
-            require(finish(queue) == 0, "Benchmark execution failed");
+                require(run(queue, width, height, static_cast<float>(frame), s.data(), src, dst), "Benchmark render failed");
+            require(finishQueue(queue), "Benchmark execution failed");
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() / 12.0;
             if (s[27]==color::HDRPQOutput)
                 std::printf("HDR timing: peak %.0f, exposure %.1f EV, rolloff %.1f.\n",s[film::HDRPeak],s[film::HDRExposure],s[film::HDRRolloff]);
@@ -1539,64 +1657,59 @@ public:
             for (const auto& control : look::Controls) s[control.setting] = static_cast<float>(recipe[control.setting]);
             s[film::ModuleIndex] = static_cast<float>(recipe[film::ModuleIndex]);
             s[26] = color::AlexaLogC3; s[27] = 1;
-            require(RunOpenEmulsionOpenCL(queue,width,height,0,s.data(),reinterpret_cast<const float*>(src),reinterpret_cast<float*>(dst)),"Look benchmark warmup failed");
-            require(finish(queue) == 0,"Look benchmark warmup execution failed");
+            require(run(queue,width,height,0,s.data(), src, dst),"Look benchmark warmup failed");
+            require(finishQueue(queue),"Look benchmark warmup execution failed");
             const auto start = std::chrono::steady_clock::now();
             for (int frame = 0; frame < 12; ++frame)
-                require(RunOpenEmulsionOpenCL(queue,width,height,frame,s.data(),reinterpret_cast<const float*>(src),reinterpret_cast<float*>(dst)),"Look benchmark render failed");
-            require(finish(queue) == 0,"Look benchmark execution failed");
+                require(run(queue,width,height,frame,s.data(), src, dst),"Look benchmark render failed");
+            require(finishQueue(queue),"Look benchmark execution failed");
             const double ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count()/12;
             std::printf("4K LogC3 look %s: %.2f ms/frame (GPU resident, full recipe, excludes Resolve/transfers).\n",look::Labels[preset],ms);
         }
-        releaseMem(src);
-        releaseMem(dst);
+        release(src);
+        release(dst);
         // Unlike the neutral timing field above, this activates retention on every pixel.
         for (size_t i=0; i<input.size(); i+=4) {
             input[i]=.85f; input[i+1]=.42f; input[i+2]=.51f; input[i+3]=1;
         }
-        src=createBuffer(context,4|32,bytes,input.data(),&error);
-        require(error==0,"Cannot allocate colored timing input");
-        dst=createBuffer(context,1,bytes,nullptr,&error);
-        require(error==0,"Cannot allocate colored timing output");
+        src=allocate(bytes,input.data(),"Cannot allocate colored timing input");
+        dst=allocate(bytes,nullptr,"Cannot allocate colored timing output");
         for (int mode : {0,1}) for (float amount : {0.0f,.5f,1.0f}) {
             auto s=filmSettings(); s[0]=static_cast<float>(mode); s[26]=color::AlexaLogC3; s[27]=1;
             s[16]=.16f; s[film::HighlightRetention]=amount;
-            require(RunOpenEmulsionOpenCL(queue,width,height,0,s.data(),reinterpret_cast<const float*>(src),reinterpret_cast<float*>(dst)),"Retention timing warmup failed");
-            require(finish(queue)==0,"Retention timing warmup execution failed");
+            require(run(queue,width,height,0,s.data(), src, dst),"Retention timing warmup failed");
+            require(finishQueue(queue),"Retention timing warmup execution failed");
             const auto start=std::chrono::steady_clock::now();
             for (int frame=0; frame<12; ++frame)
-                require(RunOpenEmulsionOpenCL(queue,width,height,frame,s.data(),reinterpret_cast<const float*>(src),reinterpret_cast<float*>(dst)),"Retention timing render failed");
-            require(finish(queue)==0,"Retention timing execution failed");
+                require(run(queue,width,height,frame,s.data(), src, dst),"Retention timing render failed");
+            require(finishQueue(queue),"Retention timing execution failed");
             const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count()/12;
             std::printf("4K colored HDR LogC3, mode %d, highlight retention %.2f: %.2f ms/frame (GPU resident, every-pixel activation, excludes Resolve/transfers).\n",mode,amount,ms);
         }
         for (int mode : {0,1}) for (float tuning : {0.0f,-1.0f,1.0f}) {
             auto s=filmSettings(); s[0]=static_cast<float>(mode); s[26]=color::AlexaLogC3; s[27]=1;
             s[16]=.16f; s[film::SDRContrast]=s[film::SDRRolloff]=s[film::SDRGamut]=tuning;
-            require(RunOpenEmulsionOpenCL(queue,width,height,0,s.data(),reinterpret_cast<const float*>(src),reinterpret_cast<float*>(dst)),"SDR control timing warmup failed");
-            require(finish(queue)==0,"SDR control timing warmup execution failed");
+            require(run(queue,width,height,0,s.data(), src, dst),"SDR control timing warmup failed");
+            require(finishQueue(queue),"SDR control timing warmup execution failed");
             const auto start=std::chrono::steady_clock::now();
             for (int frame=0; frame<12; ++frame)
-                require(RunOpenEmulsionOpenCL(queue,width,height,frame,s.data(),reinterpret_cast<const float*>(src),reinterpret_cast<float*>(dst)),"SDR control timing render failed");
-            require(finish(queue)==0,"SDR control timing execution failed");
+                require(run(queue,width,height,frame,s.data(), src, dst),"SDR control timing render failed");
+            require(finishQueue(queue),"SDR control timing execution failed");
             const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count()/12;
             std::printf("4K colored LogC3 SDR, mode %d, viewing controls %.2f: %.2f ms/frame (GPU resident, excludes Resolve/transfers).\n",mode,tuning,ms);
         }
-        releaseMem(src); releaseMem(dst);
+        release(src); release(dst);
     }
 
     std::vector<float> render(const std::vector<float>& input, int width, int height, const grain::PackedSettings& s)
     {
         const size_t bytes = input.size() * sizeof(float);
-        int error = 0;
-        Handle src = createBuffer(context, 4 | 32, bytes, const_cast<float*>(input.data()), &error);
-        require(error == 0, "Cannot create color test input");
-        Handle dst = createBuffer(context, 1, bytes, nullptr, &error);
-        require(error == 0, "Cannot create color test output");
-        require(RunOpenEmulsionOpenCL(queue, width, height, 0.0, s.data(), reinterpret_cast<const float*>(src), reinterpret_cast<float*>(dst)), "Color module render failed");
+        Handle src = allocate(bytes, input.data(), "Cannot create color test input");
+        Handle dst = allocate(bytes, nullptr, "Cannot create color test output");
+        require(run(queue, width, height, 0.0, s.data(), src, dst), "Color module render failed");
         std::vector<float> output(input.size());
-        require(readBuffer(queue, dst, 1, 0, bytes, output.data(), 0, nullptr, nullptr) == 0, "Cannot read color result");
-        releaseMem(src); releaseMem(dst);
+        require(read(queue, dst, bytes, output.data()), "Cannot read color result");
+        release(src); release(dst);
         return output;
     }
 
@@ -1632,7 +1745,7 @@ public:
             require(print[i] == printWithIgnoredControls[i], "Disabled Film Color still influences Print");
             require(input[i] == bypass[i], "All-disabled color mode alters HDR/negative values or alpha");
         }
-        std::puts("OpenCL: independent Film Color/Print compose correctly; disabled color controls have no effect; exact float pass-through passes.");
+        say(": independent Film Color/Print compose correctly; disabled color controls have no effect; exact float pass-through passes.");
     }
 
     void testManagedColor()
@@ -1682,9 +1795,9 @@ public:
                     const auto result = render(input, width, height, s);
                     for (size_t i = 0; i < result.size(); i += 4) {
                         const auto expected = color_from_work({reference[i], reference[i+1], reference[i+2]}, p);
-                        requireNear(result[i], expected.r, 4e-5f, "Managed film R");
-                        requireNear(result[i+1], expected.g, 4e-5f, "Managed film G");
-                        requireNear(result[i+2], expected.b, 4e-5f, "Managed film B");
+                        requireNearEncoded(result[i], expected.r, p.outputCurve, 4e-5f, "Managed film R");
+                        requireNearEncoded(result[i+1], expected.g, p.outputCurve, 4e-5f, "Managed film G");
+                        requireNearEncoded(result[i+2], expected.b, p.outputCurve, 4e-5f, "Managed film B");
                         require(result[i+3] == input[i+3], "Managed alpha changed");
                     }
                 }
@@ -1706,7 +1819,7 @@ public:
             s[16] = 0.0f;
             require(input == render(input, width, height, s), "Zero-grain managed mode changes image");
         }
-        std::puts("OpenCL: all input/output spaces, independent film stages, managed halation/grain, exact bypass/zero-grain, alpha, and texture-only output preservation pass.");
+        say(": all input/output spaces, independent film stages, managed halation/grain, exact bypass/zero-grain, alpha, and texture-only output preservation pass.");
     }
 
     void testGrainResponse()
@@ -1783,7 +1896,7 @@ public:
                 test(33,31,s,false,-12.25);
                 if (unordered && source == color::AlexaLogC3) test(17,19,s,true,37);
             }
-        std::puts("OpenCL: pre-print grain order, print interaction, stable geometry, zero/disabled/bypass/matte/texture isolation, alpha, all sources/families/styles, partial strengths, and glow composition pass.");
+        say(": pre-print grain order, print interaction, stable geometry, zero/disabled/bypass/matte/texture isolation, alpha, all sources/families/styles, partial strengths, and glow composition pass.");
     }
 
     void testPrintPresetTransitions()
@@ -1832,7 +1945,7 @@ public:
             s[11] = 0.61f; s[35] = 0.43f; s[36] = 1.35f; s[12] = 0.72f;
             test(width,height,s,false,37);
         }
-        std::puts("OpenCL: exact preset-to-Custom transitions in all spaces/modes, locked recipe immunity, Custom tuning parity, and bypass pass.");
+        say(": exact preset-to-Custom transitions in all spaces/modes, locked recipe immunity, Custom tuning parity, and bypass pass.");
     }
 
     void testMonochromeOutput()
@@ -1911,7 +2024,7 @@ public:
         double grainDifference = 0;
         for (size_t i = 0; i < monoGrain.size(); i += 4) grainDifference += std::abs(monoGrain[i]-withoutGrain[i]);
         require(grainDifference > 0.01,"Mono suppresses grain");
-        std::puts("OpenCL: neutral Mono with print/halation/aura/grain across all input/output spaces, partial strengths, alpha, active effects, and exact mode/module isolation pass.");
+        say(": neutral Mono with print/halation/aura/grain across all input/output spaces, partial strengths, alpha, active effects, and exact mode/module isolation pass.");
     }
 
     void testBloomControls()
@@ -1997,7 +2110,7 @@ public:
         s[4] = s[5] = s[6] = 2; s[13] = s[15] = s[16] = 2; s[film::PushPull] = 3; s[film::SplitTone] = 1;
         s[film::BloomProtection] = 0; s[27] = 5;
         require(matte == render(input,width,height,s),"Bloom Matte includes grade, texture, protection, or output transform");
-        std::puts("OpenCL: Bloom RGB/matte CPU parity, all inputs/modes/masks, resizing/bypass, alpha, blue/neutral diffusion, exact isolation, and Mono preservation pass.");
+        say(": Bloom RGB/matte CPU parity, all inputs/modes/masks, resizing/bypass, alpha, blue/neutral diffusion, exact isolation, and Mono preservation pass.");
     }
 
     void writeBloomPreview(const char* path)
@@ -2062,7 +2175,7 @@ public:
                 }
             }
         }
-        std::puts("OpenCL: Push/Pull preserves rendered grain geometry for every style, including stretched RGB grain.");
+        say(": Push/Pull preserves rendered grain geometry for every style, including stretched RGB grain.");
         for (int source = 0; source < color::SpaceCount; ++source) {
             for (int mode = 0; mode <= 5; ++mode) for (float push : {-3.0f,0.0f,3.0f}) {
                 auto s = filmSettings();
@@ -2123,7 +2236,7 @@ public:
             requireNear(mono[i],mono[i+1],2e-6f,"Development recolors Mono");
             requireNear(mono[i],mono[i+2],2e-6f,"Channel grain recolors Mono");
         }
-        std::puts("OpenCL: development and advanced grain parity in every space/mode, all masks, visible controls, exact neutral/disabled isolation, and Mono preservation pass.");
+        say(": development and advanced grain parity in every space/mode, all masks, visible controls, exact neutral/disabled isolation, and Mono preservation pass.");
     }
 
     void testDisplayRendering()
@@ -2212,7 +2325,7 @@ public:
                 require(pair[3]==.37f && pair[7]==.37f,"GPU emitter detail changes alpha");
             }
         }
-        std::puts("OpenCL SDR: nearby bright red/blue/yellow intensity pairs retain tonal contrast, including negative wide-gamut channels.");
+        say(" SDR: nearby bright red/blue/yellow intensity pairs retain tonal contrast, including negative wide-gamut channels.");
         for (float amount : {0.0f,.5f,1.0f}) for (int preset=1; preset<look::Count; ++preset) {
             const auto recipe=look::recipe(preset);
             for (size_t i=0; i<s.size(); ++i) s[i]=static_cast<float>(recipe[i]);
@@ -2221,7 +2334,7 @@ public:
             s[0]=1; test(17,19,s,false);
         }
         testHDRRendering();
-        std::puts("OpenCL SDR/HDR: all spaces/options/retention amounts, all recipes, gray/gradation, exposure order, alpha, unchanged skin/display-ready input, and texture/bypass/matte isolation match CPU.");
+        say(" SDR/HDR: all spaces/options/retention amounts, all recipes, gray/gradation, exposure order, alpha, unchanged skin/display-ready input, and texture/bypass/matte isolation match CPU.");
     }
 
     void testHDRRendering()
@@ -2315,7 +2428,7 @@ public:
         s[film::OutputRendering]=color::StandardHDR; s[film::HDRPeak]=10000; s[film::HDRWhite]=300;
         s[film::HDRExposure]=4; s[film::HDRRolloff]=1;
         require(matte==render(input,1,1,s),"HDR encodes Selection Matte");
-        std::puts("OpenCL HDR PQ: all peak/reference-white limits, independent anchors, alpha, full color/glow/grain, recipes, unordered queue and texture/matte/bypass isolation pass.");
+        say(" HDR PQ: all peak/reference-white limits, independent anchors, alpha, full color/glow/grain, recipes, unordered queue and texture/matte/bypass isolation pass.");
     }
 
     void testUpgradeControls()
@@ -2400,7 +2513,7 @@ public:
             s[film::FilmGauge] = gauge::Custom;
             require(bloomOnly == render(input,width,height,s), "Gauge affects bloom-only processing");
         }
-        std::puts("OpenCL: partial/zero color-tone parity in all spaces, all gauges/modes, enlarged/odd grids, and control isolation pass.");
+        say(": partial/zero color-tone parity in all spaces, all gauges/modes, enlarged/odd grids, and control isolation pass.");
     }
 
     void testNegativeCompression()
@@ -2445,7 +2558,7 @@ public:
                 test(17,19,s,false);
             }
         }
-        std::puts("OpenCL: negative-only gamut amount endpoints/near-zero/intermediates, saturated/HDR chips, separate-node Print composition, alpha, and CPU parity in all input spaces pass.");
+        say(": negative-only gamut amount endpoints/near-zero/intermediates, saturated/HDR chips, separate-node Print composition, alpha, and CPU parity in all input spaces pass.");
     }
 
     void testFilmResponse()
@@ -2505,9 +2618,183 @@ public:
         s[32] = 1.0f; s[33] = 2.0f; s[34] = s[35] = 1.0f;
         s[36] = 2.0f; s[37] = s[38] = s[39] = s[40] = 2.0f;
         require(isolatedNegative == render(input, width, height, s), "Disabled upgraded print affects negative");
-        std::puts("OpenCL: Film Response CPU parity across all spaces, six negatives, four prints, all module masks, HDR/negative input, balance, and texture isolation pass.");
+        say(": Film Response CPU parity across all spaces, six negatives, four prints, all module masks, HDR/negative input, balance, and texture isolation pass.");
     }
 };
+
+// Every GPU parity sweep (grain, color, film response, halation, bloom, bypass/alpha, negative/HDR input)
+// runs identically against each available GPU backend with the same CPU references and tolerances.
+static void runGpuSuite(Gpu& gpu, int argc, char** argv, bool writePreviews)
+{
+    for (bool unordered : {false, true}) {
+        if (unordered && !gpu.unordered) continue;
+        for (auto dimensions : std::array<std::array<int, 2>, 6>{{{1, 1}, {3, 5}, {128, 130}, {129, 131}, {257, 255}, {17, 19}}}) {
+            for (float radius : {0.0f, 0.25f, 1.0f, 2.0f}) {
+                for (auto s : {settings(radius), settings(radius, 1.0f, 0.0f), settings(radius, 0.0f, 1.0f),
+                               settings(radius, 1.0f, 1.0f, 5), settings(radius, 1.0f, 1.0f, 4), settings(radius, 1.0f, 1.0f, 3),
+                               settings(radius, 0.0f, 0.0f)})
+                    gpu.test(dimensions[0], dimensions[1], s, unordered);
+            }
+        }
+        std::printf("%s: CPU parity, independent controls, mode switches, alpha, and buffer resizing pass (%s queue).\n", gpu.label(), unordered ? "out-of-order" : "in-order");
+        for (int style = 0; style < 4; ++style) {
+            for (double time : {-12.25, 37.0, 16777217.25}) {
+                auto s = settings(1.0f, 1.0f, 1.0f, 2);
+                s[3] = static_cast<float>(style);
+                s[16] = 0.65f; s[17] = 0.75f; s[18] = 0.60f; s[25] = 123457.0f;
+                gpu.test(257, 129, s, unordered, time);
+                s[20] = 1.0f; s[21] = 0.0f;
+                gpu.test(257, 129, s, unordered, time);
+            }
+        }
+        for (int mask = 0; mask <= film::All; ++mask) {
+            auto s = settings(1.0f, 1.0f, 1.0f, 2);
+            s[16] = 0.65f;
+            s[19] = static_cast<float>(mask);
+            gpu.test(129, 131, s, unordered, 37.0);
+            s[0] = 5.0f;
+            gpu.test(129, 131, s, unordered, 37.0);
+            s[0] = 1.0f;
+            s[19] = static_cast<float>(mask & ~(film::Negative | film::Print));
+            gpu.test(17, 19, s, unordered, 37.0);
+            s[0] = 0.0f;
+            gpu.test(17, 19, s, unordered, 37.0);
+        }
+        gpu.say(": grain CPU/GPU parity, large/negative frame times, all module masks, and empty matte pass.");
+    }
+    if (!gpu.unordered) std::printf("%s out-of-order queue checks skipped: unsupported by this GPU driver.\n", gpu.label());
+    gpu.testColorModules();
+    for (int source = 0; source < static_cast<int>(color::spaces().size()); ++source) {
+        for (int mode : {2, 3, 5}) {
+            auto s = settings(2.0f, 1.0f, 0.5f, mode);
+            s[26] = static_cast<float>(source); s[27] = 1.0f;
+            s[16] = 0.65f; s[3] = 1.0f; s[17] = 0.45f;
+            gpu.test(65, 63, s, false, 37.0);
+        }
+    }
+    gpu.testManagedColor();
+    gpu.testFilmResponse();
+    gpu.testNegativeCompression();
+    gpu.testPrintPresetTransitions();
+    gpu.testMonochromeOutput();
+    gpu.testUpgradeControls();
+    gpu.testDevelopmentControls();
+    gpu.testGrainResponse();
+    gpu.testBloomControls();
+    for (int source = 0; source < color::SpaceCount; ++source) for (int system = 0; system < 6; ++system) {
+        for (float direction : {-1.0f,1.0f}) {
+            auto s = filmSettings();
+            s[0] = 0; s[1] = static_cast<float>(system); s[26] = static_cast<float>(source);
+            s[2] = printstyle::Custom; s[27] = 1;
+            s[7] = direction < 0 ? -1.2f : 1.5f; s[29] = 3; s[31] = direction*3;
+            s[film::SplitTone] = 3; s[film::SplitHue] = 205;
+            s[16] = .6f; s[17] = .55f; s[20] = 2; s[21] = .5f;
+            const auto balance = color::cameraBalance(.4,direction*3,-direction*3);
+            s[4]=balance.r; s[5]=balance.g; s[6]=balance.b;
+            gpu.test(65,63,s,false,37);
+            s[0] = 4;
+            gpu.test(17,19,s,false);
+            s[0] = 0; s[19] = 0;
+            gpu.test(17,19,s,false);
+        }
+    }
+    for (int style = 0; style < 4; ++style) for (float softness : {1.001f,1.25f,1.5f,1.75f,2.0f})
+        for (int height : {63,130,271}) {
+            auto s = settings(1,0,0,3);
+            s[3] = static_cast<float>(style); s[16] = .6f; s[17] = .65f; s[20] = softness;
+            s[21] = .8f; s[25] = 123457; s[film::GrainStretch] = 2;
+            gpu.test(129,height,s,false,-12.25);
+            if (gpu.unordered) gpu.test(129,height,s,true,37);
+        }
+    gpu.say(": expanded color endpoints and primary grain smoothing match CPU in every input/system; bypass, alpha, styles, resizing, and stretched RGB grain pass.");
+    for (int preset = 1; preset < look::Count; ++preset) {
+        const auto recipe = look::recipe(preset);
+        auto s = filmSettings();
+        for (const auto& control : look::Controls)
+            s[control.setting] = static_cast<float>(recipe[control.setting]);
+        s[film::ModuleIndex] = static_cast<float>(recipe[film::ModuleIndex]);
+        s[25] = 1327;
+        for (int source = 0; source < color::SpaceCount; ++source) {
+            s[26] = static_cast<float>(source);
+            for (int output = 0; output < static_cast<int>(color::OutputSpaces.size()); ++output) {
+                s[27] = static_cast<float>(output);
+                gpu.test(33,31,s,false,37.0);
+            }
+        }
+        for (int mode : {1,2,3,4,5,6}) {
+            s[0]=static_cast<float>(mode);
+            gpu.test(65,63,s,false,-12.25);
+        }
+        s[0]=0; s[film::ModuleIndex]=0;
+        gpu.test(17,19,s,false);
+    }
+    std::printf("%s: all %d look recipes match CPU across input/output spaces, mode overrides, alpha, and all-disabled bypass.\n",gpu.label(),look::Count-1);
+    for (int source=0; source<color::SpaceCount; ++source) for (int output=0; output<static_cast<int>(color::OutputSpaces.size()); ++output) {
+        auto s=filmSettings(); s[26]=static_cast<float>(source); s[27]=static_cast<float>(output);
+        s[film::SelectiveAmount]=.65; s[film::SelectiveHue]=355; s[film::SelectiveRange]=12;
+        s[film::SelectiveSoftness]=14; s[film::SelectiveSaturation]=.35;
+        s[4]=1.2f; s[5]=.9f; s[6]=1.1f;
+        for (int mask : std::array<int,4>{film::SelectiveColor,film::All,film::All & ~film::SelectiveColor,0}) {
+            s[film::ModuleIndex]=static_cast<float>(mask);
+            for (int view : {0,1}) {
+                s[film::SelectiveView]=static_cast<float>(view);
+                gpu.test(17,19,s,false);
+            }
+        }
+    }
+    for (int mode=0; mode<7; ++mode) {
+        auto s=filmSettings(); s[0]=static_cast<float>(mode); s[film::SelectiveAmount]=1;
+        s[film::SelectiveRange]=0; s[film::SelectiveSoftness]=0; s[film::SelectiveView]=1;
+        gpu.test(33,31,s,false);
+        if (gpu.unordered) gpu.test(33,31,s,true);
+    }
+    gpu.say(": selective image/matte, partial amount, wrap, camera balance, every encoding, independent/disabled modules, mode overrides and queue ordering match CPU.");
+    gpu.testDisplayRendering();
+    {
+        auto s=filmSettings(); s[0]=0; s[26]=color::SRGB;
+        s[film::ModuleIndex]=film::SelectiveColor; s[film::SelectiveView]=1;
+        s[film::SelectiveRange]=12; s[film::SelectiveSoftness]=14; s[film::SelectiveSaturation]=.45;
+        std::vector<float> input;
+        for (const auto c : std::array<ColorRgb,5>{{hueSample(0),hueSample(20),hueSample(120),{.5f,.5f,.5f},{0,0,0}}})
+            input.insert(input.end(),{c.r,c.g,c.b,.37f});
+        const auto p=response::prepare(s.data());
+        for (int output=0; output<static_cast<int>(color::OutputSpaces.size()); ++output) {
+            s[27]=static_cast<float>(output);
+            const auto result=gpu.render(input,5,1,s);
+            for (int x=0; x<5; ++x) {
+                const auto i=x*4;
+                const float mask=response_selective_mask({input[i],input[i+1],input[i+2]},p);
+                for (int channel=0; channel<3; ++channel)
+                    requireNear(result[i+channel],mask,1e-6f,"Selection matte is color-space encoded or tinted");
+                require(result[i+3]==input[i+3],"Selection matte changes alpha");
+            }
+            s[film::SelectiveView]=0; s[film::SelectiveAmount]=0;
+            require(gpu.render(input,5,1,s)==input,"Zero selective-only render is not exact identity");
+            s[film::SelectiveView]=1;
+        }
+        s[film::SelectiveView]=0; s[film::SelectiveAmount]=1; s[27]=1;
+        const auto cp=color::prepare(s.data());
+        require(cp.outputCurve == ColorGamma24,"Selective-only ignores requested output encoding");
+        const std::vector<float> accent{.8f,0,0,.37f};
+        const auto converted=gpu.render(accent,1,1,s);
+        requireNear(converted[0],color_encode(color_decode(.8f,ColorSRGB),ColorGamma24),1e-6f,
+            "Retained accent skips output conversion");
+        s[film::ModuleIndex]=film::All; s[13]=.3f; s[15]=.1f; s[16]=.2f; s[21]=1;
+        s[film::BloomAmount]=.2f;
+        const std::vector<float> green{.01f,.8f,.01f,.37f};
+        const auto neutral=gpu.render(green,1,1,s);
+        requireNear(neutral[0],neutral[1],1e-6f,"Grain/glow recolors rejected source");
+        requireNear(neutral[1],neutral[2],1e-6f,"Selective finish retains colored texture");
+    }
+    if (writePreviews && argc > 3) gpu.writeTexturePreview(argv[3]);
+    if (writePreviews && argc > 4) gpu.writeTexturePreview(argv[4],true);
+    if (writePreviews && argc > 6) gpu.writeBloomPreview(argv[6]);
+    if (writePreviews && argc > 7) gpu.writeLookPreview(argv[7]);
+    if (writePreviews && argc > 9) gpu.writeGrainResponsePreview(argv[9]);
+    if (writePreviews && argc > 10) gpu.writeLookPreview(argv[10],look::ArchiveThriller);
+    if (writePreviews && argc > 11) gpu.writeLookPreview(argv[11],look::WinterCrime);
+    gpu.benchmark();
+}
 
 int main(int argc, char** argv)
 {
@@ -2530,179 +2817,23 @@ int main(int argc, char** argv)
         if (argc > 2) writeResponsePreview(argv[2]);
         if (argc > 5) writeResponsePreview(argv[5],true);
         if (argc > 8) writePreview(argv[8],true);
-        Gpu gpu;
-        if (!gpu.queue) {
-            std::puts("OpenCL tests skipped: no GPU device available.");
-            return 0;
+        bool previews = true;
+        for (Gpu::Backend backend : {Gpu::OpenCL, Gpu::Cuda}) {
+#ifndef OPENEMULSION_HAVE_CUDA
+            if (backend == Gpu::Cuda) {
+                std::puts("CUDA tests skipped: plugin built without the CUDA backend.");
+                continue;
+            }
+#endif
+            Gpu gpu(backend);
+            if (!gpu.queue) {
+                if (backend == Gpu::Cuda) std::puts("CUDA tests skipped: no CUDA device available.");
+                else std::puts("OpenCL tests skipped: no GPU device available.");
+                continue;
+            }
+            runGpuSuite(gpu, argc, argv, previews);
+            previews = false;
         }
-        for (bool unordered : {false, true}) {
-            if (unordered && !gpu.unordered) continue;
-            for (auto dimensions : std::array<std::array<int, 2>, 6>{{{1, 1}, {3, 5}, {128, 130}, {129, 131}, {257, 255}, {17, 19}}}) {
-                for (float radius : {0.0f, 0.25f, 1.0f, 2.0f}) {
-                    for (auto s : {settings(radius), settings(radius, 1.0f, 0.0f), settings(radius, 0.0f, 1.0f),
-                                   settings(radius, 1.0f, 1.0f, 5), settings(radius, 1.0f, 1.0f, 4), settings(radius, 1.0f, 1.0f, 3),
-                                   settings(radius, 0.0f, 0.0f)})
-                        gpu.test(dimensions[0], dimensions[1], s, unordered);
-                }
-            }
-            std::printf("OpenCL: CPU parity, independent controls, mode switches, alpha, and buffer resizing pass (%s queue).\n", unordered ? "out-of-order" : "in-order");
-            for (int style = 0; style < 4; ++style) {
-                for (double time : {-12.25, 37.0, 16777217.25}) {
-                    auto s = settings(1.0f, 1.0f, 1.0f, 2);
-                    s[3] = static_cast<float>(style);
-                    s[16] = 0.65f; s[17] = 0.75f; s[18] = 0.60f; s[25] = 123457.0f;
-                    gpu.test(257, 129, s, unordered, time);
-                    s[20] = 1.0f; s[21] = 0.0f;
-                    gpu.test(257, 129, s, unordered, time);
-                }
-            }
-            for (int mask = 0; mask <= film::All; ++mask) {
-                auto s = settings(1.0f, 1.0f, 1.0f, 2);
-                s[16] = 0.65f;
-                s[19] = static_cast<float>(mask);
-                gpu.test(129, 131, s, unordered, 37.0);
-                s[0] = 5.0f;
-                gpu.test(129, 131, s, unordered, 37.0);
-                s[0] = 1.0f;
-                s[19] = static_cast<float>(mask & ~(film::Negative | film::Print));
-                gpu.test(17, 19, s, unordered, 37.0);
-                s[0] = 0.0f;
-                gpu.test(17, 19, s, unordered, 37.0);
-            }
-            std::puts("OpenCL: grain CPU/GPU parity, large/negative frame times, all module masks, and empty matte pass.");
-        }
-        if (!gpu.unordered) std::puts("Out-of-order queue checks skipped: unsupported by this GPU driver.");
-        gpu.testColorModules();
-        for (int source = 0; source < static_cast<int>(color::spaces().size()); ++source) {
-            for (int mode : {2, 3, 5}) {
-                auto s = settings(2.0f, 1.0f, 0.5f, mode);
-                s[26] = static_cast<float>(source); s[27] = 1.0f;
-                s[16] = 0.65f; s[3] = 1.0f; s[17] = 0.45f;
-                gpu.test(65, 63, s, false, 37.0);
-            }
-        }
-        gpu.testManagedColor();
-        gpu.testFilmResponse();
-        gpu.testNegativeCompression();
-        gpu.testPrintPresetTransitions();
-        gpu.testMonochromeOutput();
-        gpu.testUpgradeControls();
-        gpu.testDevelopmentControls();
-        gpu.testGrainResponse();
-        gpu.testBloomControls();
-        for (int source = 0; source < color::SpaceCount; ++source) for (int system = 0; system < 6; ++system) {
-            for (float direction : {-1.0f,1.0f}) {
-                auto s = filmSettings();
-                s[0] = 0; s[1] = static_cast<float>(system); s[26] = static_cast<float>(source);
-                s[2] = printstyle::Custom; s[27] = 1;
-                s[7] = direction < 0 ? -1.2f : 1.5f; s[29] = 3; s[31] = direction*3;
-                s[film::SplitTone] = 3; s[film::SplitHue] = 205;
-                s[16] = .6f; s[17] = .55f; s[20] = 2; s[21] = .5f;
-                const auto balance = color::cameraBalance(.4,direction*3,-direction*3);
-                s[4]=balance.r; s[5]=balance.g; s[6]=balance.b;
-                gpu.test(65,63,s,false,37);
-                s[0] = 4;
-                gpu.test(17,19,s,false);
-                s[0] = 0; s[19] = 0;
-                gpu.test(17,19,s,false);
-            }
-        }
-        for (int style = 0; style < 4; ++style) for (float softness : {1.001f,1.25f,1.5f,1.75f,2.0f})
-            for (int height : {63,130,271}) {
-                auto s = settings(1,0,0,3);
-                s[3] = static_cast<float>(style); s[16] = .6f; s[17] = .65f; s[20] = softness;
-                s[21] = .8f; s[25] = 123457; s[film::GrainStretch] = 2;
-                gpu.test(129,height,s,false,-12.25);
-                if (gpu.unordered) gpu.test(129,height,s,true,37);
-            }
-        std::puts("OpenCL: expanded color endpoints and primary grain smoothing match CPU in every input/system; bypass, alpha, styles, resizing, and stretched RGB grain pass.");
-        for (int preset = 1; preset < look::Count; ++preset) {
-            const auto recipe = look::recipe(preset);
-            auto s = filmSettings();
-            for (const auto& control : look::Controls)
-                s[control.setting] = static_cast<float>(recipe[control.setting]);
-            s[film::ModuleIndex] = static_cast<float>(recipe[film::ModuleIndex]);
-            s[25] = 1327;
-            for (int source = 0; source < color::SpaceCount; ++source) {
-                s[26] = static_cast<float>(source);
-                for (int output = 0; output < static_cast<int>(color::OutputSpaces.size()); ++output) {
-                    s[27] = static_cast<float>(output);
-                    gpu.test(33,31,s,false,37.0);
-                }
-            }
-            for (int mode : {1,2,3,4,5,6}) {
-                s[0]=static_cast<float>(mode);
-                gpu.test(65,63,s,false,-12.25);
-            }
-            s[0]=0; s[film::ModuleIndex]=0;
-            gpu.test(17,19,s,false);
-        }
-        std::printf("OpenCL: all %d look recipes match CPU across input/output spaces, mode overrides, alpha, and all-disabled bypass.\n",look::Count-1);
-        for (int source=0; source<color::SpaceCount; ++source) for (int output=0; output<static_cast<int>(color::OutputSpaces.size()); ++output) {
-            auto s=filmSettings(); s[26]=static_cast<float>(source); s[27]=static_cast<float>(output);
-            s[film::SelectiveAmount]=.65; s[film::SelectiveHue]=355; s[film::SelectiveRange]=12;
-            s[film::SelectiveSoftness]=14; s[film::SelectiveSaturation]=.35;
-            s[4]=1.2f; s[5]=.9f; s[6]=1.1f;
-            for (int mask : std::array<int,4>{film::SelectiveColor,film::All,film::All & ~film::SelectiveColor,0}) {
-                s[film::ModuleIndex]=static_cast<float>(mask);
-                for (int view : {0,1}) {
-                    s[film::SelectiveView]=static_cast<float>(view);
-                    gpu.test(17,19,s,false);
-                }
-            }
-        }
-        for (int mode=0; mode<7; ++mode) {
-            auto s=filmSettings(); s[0]=static_cast<float>(mode); s[film::SelectiveAmount]=1;
-            s[film::SelectiveRange]=0; s[film::SelectiveSoftness]=0; s[film::SelectiveView]=1;
-            gpu.test(33,31,s,false);
-            if (gpu.unordered) gpu.test(33,31,s,true);
-        }
-        std::puts("OpenCL: selective image/matte, partial amount, wrap, camera balance, every encoding, independent/disabled modules, mode overrides and queue ordering match CPU.");
-        gpu.testDisplayRendering();
-        {
-            auto s=filmSettings(); s[0]=0; s[26]=color::SRGB;
-            s[film::ModuleIndex]=film::SelectiveColor; s[film::SelectiveView]=1;
-            s[film::SelectiveRange]=12; s[film::SelectiveSoftness]=14; s[film::SelectiveSaturation]=.45;
-            std::vector<float> input;
-            for (const auto c : std::array<ColorRgb,5>{{hueSample(0),hueSample(20),hueSample(120),{.5f,.5f,.5f},{0,0,0}}})
-                input.insert(input.end(),{c.r,c.g,c.b,.37f});
-            const auto p=response::prepare(s.data());
-            for (int output=0; output<static_cast<int>(color::OutputSpaces.size()); ++output) {
-                s[27]=static_cast<float>(output);
-                const auto result=gpu.render(input,5,1,s);
-                for (int x=0; x<5; ++x) {
-                    const auto i=x*4;
-                    const float mask=response_selective_mask({input[i],input[i+1],input[i+2]},p);
-                    for (int channel=0; channel<3; ++channel)
-                        requireNear(result[i+channel],mask,1e-6f,"Selection matte is color-space encoded or tinted");
-                    require(result[i+3]==input[i+3],"Selection matte changes alpha");
-                }
-                s[film::SelectiveView]=0; s[film::SelectiveAmount]=0;
-                require(gpu.render(input,5,1,s)==input,"Zero selective-only render is not exact identity");
-                s[film::SelectiveView]=1;
-            }
-            s[film::SelectiveView]=0; s[film::SelectiveAmount]=1; s[27]=1;
-            const auto cp=color::prepare(s.data());
-            require(cp.outputCurve == ColorGamma24,"Selective-only ignores requested output encoding");
-            const std::vector<float> accent{.8f,0,0,.37f};
-            const auto converted=gpu.render(accent,1,1,s);
-            requireNear(converted[0],color_encode(color_decode(.8f,ColorSRGB),ColorGamma24),1e-6f,
-                "Retained accent skips output conversion");
-            s[film::ModuleIndex]=film::All; s[13]=.3f; s[15]=.1f; s[16]=.2f; s[21]=1;
-            s[film::BloomAmount]=.2f;
-            const std::vector<float> green{.01f,.8f,.01f,.37f};
-            const auto neutral=gpu.render(green,1,1,s);
-            requireNear(neutral[0],neutral[1],1e-6f,"Grain/glow recolors rejected source");
-            requireNear(neutral[1],neutral[2],1e-6f,"Selective finish retains colored texture");
-        }
-        if (argc > 3) gpu.writeTexturePreview(argv[3]);
-        if (argc > 4) gpu.writeTexturePreview(argv[4],true);
-        if (argc > 6) gpu.writeBloomPreview(argv[6]);
-        if (argc > 7) gpu.writeLookPreview(argv[7]);
-        if (argc > 9) gpu.writeGrainResponsePreview(argv[9]);
-        if (argc > 10) gpu.writeLookPreview(argv[10],look::ArchiveThriller);
-        if (argc > 11) gpu.writeLookPreview(argv[11],look::WinterCrime);
-        gpu.benchmark();
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAILED: %s\n", error.what());

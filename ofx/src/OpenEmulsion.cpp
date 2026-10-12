@@ -28,6 +28,9 @@
 #define kPluginIdentifier "org.openemulsion.film"
 
 extern bool RunOpenEmulsionOpenCL(void* cmdQueue, int width, int height, double time, const float* settings, const float* input, float* output);
+#ifdef OPENEMULSION_HAVE_CUDA
+#include "CudaKernel.h"
+#endif
 
 namespace {
 
@@ -243,6 +246,9 @@ public:
         haloConfig_ = halation::prepare(packed.data(), bounds.y2 - bounds.y1);
         bloomConfig_ = bloom::prepare(packed.data(), bounds.y2 - bounds.y1);
         if (_isEnabledOpenCLRender) return;
+#ifdef OPENEMULSION_HAVE_CUDA
+        if (_isEnabledCudaRender) return;
+#endif
         if (spatialEnabled(settings_)) {
             const halation::Filter filter(halationAmount(settings_), static_cast<float>(settings_.halationRadius), auraAmount(settings_),
                                           haloConfig_.auraRadius, haloConfig_.radiusScale);
@@ -278,6 +284,28 @@ public:
             OFX::throwSuiteStatusException(kOfxStatErrUnsupported);
         }
     }
+
+#ifdef OPENEMULSION_HAVE_CUDA
+    void processImagesCUDA() override
+    {
+        const OfxRectI& bounds = src_->getBounds();
+        const int width = bounds.x2 - bounds.x1;
+        const int height = bounds.y2 - bounds.y1;
+        float packed[film::SettingsCount];
+        packSettings(settings_, packed);
+        const bool ok = RunOpenEmulsionCuda(
+            _pCudaStream,
+            width,
+            height,
+            time_,
+            packed,
+            static_cast<const float*>(src_->getPixelData()),
+            static_cast<float*>(_dstImg->getPixelData()));
+        if (!ok) {
+            OFX::throwSuiteStatusException(kOfxStatErrUnsupported);
+        }
+    }
+#endif
 
     void multiThreadProcessImages(OfxRectI window) override
     {
@@ -1110,6 +1138,10 @@ public:
         desc.setSupportsMultipleClipPARs(false);
         desc.setNoSpatialAwareness(false);
         desc.setSupportsOpenCLRender(true);
+#ifdef OPENEMULSION_HAVE_CUDA
+        desc.setSupportsCudaRender(true);
+        desc.setSupportsCudaStream(true);
+#endif
     }
 
     void describeInContext(OFX::ImageEffectDescriptor& desc, OFX::ContextEnum) override

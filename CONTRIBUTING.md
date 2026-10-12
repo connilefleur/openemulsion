@@ -10,9 +10,11 @@ Follow the prerequisites and build instructions in [README.md](README.md), then 
 ctest --test-dir build/ofx --output-on-failure
 ```
 
-Windows x64 is the currently implemented platform. C++ and OpenCL compile the same grain, color, and film-response math headers. Keep those headers compatible with both languages.
+On Linux, `tools/build_ofx.sh` builds into `build`, so use `ctest --test-dir build --output-on-failure`.
 
-GPU tests need an OpenCL device and driver. The harness reports skipped GPU and out-of-order queue checks explicitly; a CPU-only pass is not GPU validation.
+Windows x64 and Linux x86-64 are the implemented platforms; keep Windows-only code under `#ifdef _WIN32`. C++, OpenCL, and CUDA compile the same grain, color, and film-response math headers. Keep those headers compatible with both languages.
+
+GPU tests need an OpenCL device and driver, and CUDA parity tests need an NVIDIA GPU and a CUDA-enabled build. The harness reports skipped GPU and out-of-order queue checks explicitly; a CPU-only pass is not GPU validation.
 
 ## Changes
 
