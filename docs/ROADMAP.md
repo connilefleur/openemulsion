@@ -60,6 +60,13 @@ Synthetic checks cover bounded extraction, colored/white sources, continuous con
 - Community preset sharing and versioned preset-format evolution. Current built-in recipes live in `ofx/src/LookPresetConfig.h`; user files use complete validated snapshots, not animation curves.
 - Reference-based profiles using film scans and measured charts to refine stock-specific response.
 - Clean-machine Resolve installation checks, other-GPU/host testing, and signed release binaries. Current ZIP checks validate extracted payloads and native OFX loading, not a second-machine Resolve session.
-- CUDA backend for NVIDIA hosts after suitable hardware/testing becomes available. GPU ownership/event handling and existing CPU/OpenCL parity must remain intact.
+- Windows CUDA builds and Resolve verification. The CUDA backend exists and is verified in Resolve on Linux; Windows builds include it only when the CUDA toolkit is present.
 
-macOS/Metal is postponed because no Mac is available for verification. Dust, scratches, borders, gate weave, and other damage effects are lower priority than core response, texture, and performance.
+macOS/Metal is postponed because no Mac is available for verification. A port needs:
+
+- a Metal backend mirroring the CUDA/OpenCL passes, with CPU parity tests (Resolve supplies Metal buffers on macOS; CUDA is unavailable)
+- OpenCL loading from `OpenCL.framework` instead of `libOpenCL.so.1`, or dropping OpenCL on macOS
+- native macOS Save/Load Preset dialogs (the non-Windows path currently uses `kdialog`/`zenity`)
+- a universal arm64/x86_64 `Contents/MacOS` bundle, code signing and notarization, verified in Resolve on a Mac
+
+Dust, scratches, borders, gate weave, and other damage effects are lower priority than core response, texture, and performance.
